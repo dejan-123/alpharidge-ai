@@ -165,6 +165,8 @@ testing/
 .vscode/settings.json
 
 # Local subnet runtime/config/state (do not commit)
+miners.yaml
+logs/miners/
 .miner_env
 .vali_env
 .tweet_store.json
@@ -180,7 +182,6 @@ article_store.json
 
 # Per-validator runtime state and secrets. Never commit these.
 alpharidge_ai/.audit_key
-.triage_draws/
 alpharidge_ai/.*_state.json
 alpharidge_ai/.mechanism_profile.json
 .audit_key

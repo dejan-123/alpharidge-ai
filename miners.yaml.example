@@ -1,0 +1,50 @@
+# SN45 Miner Fleet Configuration
+# Copy to miners.yaml and fill in your hotkeys + API keys.
+# miners.yaml is git-ignored so your keys are never committed.
+#
+# Usage after filling in:
+#   python scripts/mine.py start          # start all miners
+#   python scripts/mine.py status         # live status table
+#   python scripts/mine.py logs --name miner-01
+
+# ── Global defaults (apply to every miner unless overridden) ──────────────
+global:
+  nlp_server_url: "http://localhost:8765"   # NLP inference server (GPU machine)
+  netuid: 45
+  subtensor_network: finney                 # or ws://127.0.0.1:9946 for local
+  axon_external_ip: ""                      # your public IP; leave empty to auto-detect
+  wallet_name: my_cold_wallet               # coldkey wallet name (bittensor)
+  auto_restart: true                        # restart miner automatically on crash
+  restart_delay: 30                         # seconds to wait before restarting
+
+  # Python interpreter — leave empty to auto-detect (.venv → conda → python3)
+  # python: "/home/user/miniconda3/envs/alpharidge_ai/bin/python"
+  # conda_env: alpharidge_ai               # conda env name (if not using .venv)
+
+# ── Per-miner settings ────────────────────────────────────────────────────
+miners:
+  - name: miner-01
+    hotkey: hotkey1               # registered hotkey name (bittensor wallet)
+    api_key: sk-or-YOUR_KEY_1    # OpenRouter API key for this miner
+    axon_port: 18100
+
+  - name: miner-02
+    hotkey: hotkey2
+    api_key: sk-or-YOUR_KEY_2
+    axon_port: 18101
+
+  - name: miner-03
+    hotkey: hotkey3
+    api_key: sk-or-YOUR_KEY_3
+    axon_port: 18102
+
+  # Example: miner on a different cold wallet
+  # - name: miner-04
+  #   wallet_name: second_cold_wallet
+  #   hotkey: hotkey4
+  #   api_key: sk-or-YOUR_KEY_4
+  #   axon_port: 18103
+
+  # Add up to 20+ miners following the same pattern.
+  # Each needs a unique axon_port (18100, 18101, 18102 …)
+  # Each needs its own registered hotkey and its own OpenRouter API key.

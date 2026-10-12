@@ -1,9 +1,12 @@
 pip>=23.0
 setuptools>=68
 wheel
+fastapi>=0.111.0
+uvicorn[standard]>=0.29.0
 starlette>=0.30.0
 pydantic>=2
 rich>=13
+pyyaml>=6.0
 pytest>=8
 pytest-asyncio>=0.23   # required to run the async tests (e.g. tests/test_api_client_attestation.py)
 torch>=2
@@ -25,6 +28,8 @@ substrateinterface>=1.0.0
 # validator re-runs this exact pipeline and hard-gates output determinism, so
 # a version skew between sides breaks consensus. Pinned (not >=) for that reason.
 spacy==3.8.14
+spacy-curated-transformers==0.3.1  # pinned: _patch_curated_transformers_for_gpu patches BertEmbeddings.forward
+curated-transformers==0.1.1        # pinned: do NOT upgrade without re-verifying the GPU input patch in ner_fusion.py
 # spaCy transformer model, pinned as a wheel URL so `pip install -r` pulls it (no separate `spacy download`):
 en_core_web_trf @ https://github.com/explosion/spacy-models/releases/download/en_core_web_trf-3.8.0/en_core_web_trf-3.8.0-py3-none-any.whl
 gliner==0.2.27           # urchade/gliner_base + urchade/gliner_multi-v2.1

@@ -17,13 +17,10 @@ from datetime import datetime, timezone
 from typing import Dict, List, Optional, Tuple
 import os
 import random
-import re
 import threading
 import bittensor as bt
 import numpy as np
 
-from alpharidge_ai.analyzer.asset_extractor import known_symbols
-from alpharidge_ai.utils import llm_spend
 from alpharidge_ai.utils.api_models import TweetWithAuthor, TelegramMessageForScoring
 from .relevance import AssetRelevanceAnalyzer, PostClassification
 from .telegram_relevance import TelegramRelevanceAnalyzer, MessageGroupClassification
@@ -978,22 +975,6 @@ def _ev(x) -> str:
 # 0.70 cuts honest false-reject to ~4% while a skip-LLM miner still fails ~70% of
 # samples, so consistent failers are still sorted out. Env-overridable for tuning.
 TIER3_THRESHOLD = float(os.getenv("TIER3_THRESHOLD", "0.70"))
-SAMPLE_REPLACEMENTS = 2
-AUDIT_MAX_FAILED_REFERENCES = 2
-
-# UTF-8 Cyrillic decoded as a single-byte charset. No false positives on 400
-# Vietnamese, Polish, Romanian and Turkish articles.
-_MOJIBAKE = re.compile(r"(đ[ŤťĺşžŻŞ░▓]|Đ[ÇĂŇĆ]){2}")
-
-
-def defective_text(text) -> str:
-    """Why an article cannot be analysed, judged from its text alone, or "" if it can."""
-    body = (text or "").strip()
-    if len(body) < int(_cfg_get("DEFECTIVE_MIN_CHARS", 40)):
-        return "empty"
-    if _MOJIBAKE.search(body[:4000]):
-        return "garbled"
-    return ""
 
 
 def _ordinal_score(pred: str, gold: str, ladder: List[str]) -> float:
@@ -1173,12 +1154,6 @@ def validate_article_intelligence(
     # clear a threshold, tolerating adjacent-class jitter.
     m_assets = {a.ticker: a for a in m.assets}
     v_assets = {a.ticker: a for a in v.assets}
-    unknown = sorted(str(t) for t in m_assets if t not in known_symbols())
-    if unknown:
-        details["tier2"]["asset_tickers"] = {"status": "fail", "reason": "unknown_ticker",
-                                             "tickers": [t[:12] for t in unknown[:5]]}
-        bt.logging.warning(f"[V2_VALIDATE] Tier 2 FAIL: unknown ticker(s) {unknown[:5]}")
-        return False, 0.0, details
     # Anti-cheat presence check (asymmetric, mirrors the Tier-2.5 embedding check):
     # if the validator resolved assets but the miner submitted none, the miner is
     # skipping the agreement gate below (which is a no-op with no common assets).
@@ -1201,9 +1176,8 @@ def validate_article_intelligence(
     DETERMINISM_TOL = 0.9
     m_cont = {(l.source_ticker, l.target_ticker) for l in m.contagion_links}
     v_cont = {(l.source_ticker, l.target_ticker) for l in v.contagion_links}
-    cont_jac = _jaccard(m_cont, v_cont) if v_cont else 1.0
-    details["tier2"]["contagion_determinism"] = {"jaccard": round(cont_jac, 4),
-                                                 "reference_links": len(v_cont)}
+    cont_jac = _jaccard(m_cont, v_cont)
+    details["tier2"]["contagion_determinism"] = {"jaccard": round(cont_jac, 4)}
     if cont_jac < DETERMINISM_TOL:
         bt.logging.warning(f"[V2_VALIDATE] Tier 2 FAIL: contagion determinism jaccard={cont_jac:.2f}")
         return False, 0.0, details
@@ -1238,9 +1212,6 @@ def validate_article_intelligence(
         """Return cosine sim, or None if absent. Hard-fail (raise) on bad format."""
         if not (m_emb and v_emb and len(m_emb) == EMBEDDING_DIM and len(v_emb) == EMBEDDING_DIM):
             return None
-        if not np.all(np.isfinite(m_emb)):
-            details["tier2_5"][name] = {"status": "fail", "reason": "non_finite"}
-            raise ValueError("non_finite")
         m_norm = float(np.linalg.norm(m_emb))
         v_norm = float(np.linalg.norm(v_emb))
         if m_norm < 0.01 or v_norm < 0.01:
@@ -1360,14 +1331,6 @@ def validate_article_intelligence(
     composite = sum(tier3_scores[k] * weights[k] for k in weights)
     details["tier3"] = {k: {"score": round(tier3_scores[k], 4), "weight": weights[k]} for k in weights}
     details["tier3"]["composite"] = round(composite, 4)
-    junk = (0.15 * tier3_scores["asset_extraction"] + 0.08 * tier3_scores["entities"]) / 0.23
-    details["tier3"]["junk_score"] = round(junk, 4)
-
-    if _cfg_get("TIER3_JUNK_FILTER", True):
-        details["verdict"] = "pass"
-        bt.logging.success(f"[V2_VALIDATE] Article ACCEPTED: composite={composite:.4f} "
-                           f"junk={junk:.4f}")
-        return True, composite, details
 
     # Quality floor. Read live from config (served subnet-wide / OVERRIDE-able) so it
     # can be recalibrated without a code change AND stays identical across validators;
@@ -1379,14 +1342,10 @@ def validate_article_intelligence(
     except Exception:
         _threshold = TIER3_THRESHOLD
     is_valid = composite >= _threshold
-    details["verdict"] = "pass" if is_valid else "junk"
-    details["shadow_verdict"] = "pass"
     if is_valid:
-        bt.logging.success(f"[V2_VALIDATE] Article ACCEPTED: composite={composite:.4f} "
-                           f"junk={junk:.4f}")
+        bt.logging.success(f"[V2_VALIDATE] Article ACCEPTED: composite={composite:.4f}")
     else:
-        bt.logging.warning(f"[V2_VALIDATE] Article REJECTED: composite={composite:.4f} < {_threshold} "
-                           f"shadow=pass junk={junk:.4f}")
+        bt.logging.warning(f"[V2_VALIDATE] Article REJECTED: composite={composite:.4f} < {_threshold}")
 
     return is_valid, composite, details
 
@@ -1478,10 +1437,7 @@ def _titles_match(record, reference) -> bool:
     if reference is None:
         return True
     blob = getattr(getattr(record, "analysis", None), "analysis_data", None)
-    title = blob.get("title") if isinstance(blob, dict) else ""
-    if not isinstance(title, str):
-        return False
-    a = _normalize_text(title or "")
+    a = _normalize_text((blob.get("title") if isinstance(blob, dict) else "") or "")
     b = _normalize_text(getattr(reference, "title", "") or "")
     return a != "" and a == b
 
@@ -1728,7 +1684,6 @@ def validate_miner_article_intelligence_batch(
     auditor=None,
     block=0,
     schema_cutover_block=0,
-    marginal_allowed=False,
 ) -> Tuple[bool, Dict]:
     """Validate a miner's article batch using V2 4-tier validation.
 
@@ -1761,8 +1716,6 @@ def validate_miner_article_intelligence_batch(
 
     sample_size = min(sample_size, len(miner_batch))
     sampled = random.sample(miner_batch, sample_size)
-    spares = [a for a in miner_batch if all(a is not s for s in sampled)]
-    random.shuffle(spares)
 
     bt.logging.info(f"[V2_VALIDATE] Sampling {sample_size} article(s) from batch of {len(miner_batch)}")
 
@@ -1776,7 +1729,6 @@ def validate_miner_article_intelligence_batch(
     _log_floor_stats(miner_hotkey, floor_stats)
 
     matches = 0
-    skipped = 0
     total_composite = 0.0
     discrepancies = []
     observations = []  # (article_id, graded, weight) when graded_scorer is set
@@ -1785,32 +1737,6 @@ def validate_miner_article_intelligence_batch(
     reference_irrelevant = []  # (article_id, bool) — True when our own reference
     # says the article is clearly outside the rubric; feeds triage FP events
     # and negative-canary selection
-    defective_ids = []        # samples set aside because the article itself is broken
-    confirm = None            # a marginal content mismatch awaiting its second sample
-    marginal_used = False
-    band_low = float(_cfg_get("MARGINAL_BAND_LOW", 0.35))
-    confirm_floor = float(_cfg_get("MARGINAL_CONFIRM_FLOOR", 0.50))
-
-    replaced = 0              # replacement draws for samples we could not grade
-
-    def _reinstate():
-        nonlocal skipped, confirm
-        if confirm is not None:
-            skipped -= 1
-            discrepancies.append(confirm["discrepancy"])
-            confirm = None
-
-    def _replace(is_confirm):
-        """Draw a spare for a sample we could not grade. A confirmation that hit our own
-        problem moves to the spare; with none left, the first result stands."""
-        nonlocal replaced
-        if spares and replaced < SAMPLE_REPLACEMENTS and not llm_spend.paused():
-            replaced += 1
-            sampled.append(spares.pop())
-            if is_confirm:
-                confirm["index"] = len(sampled) - 1
-        elif is_confirm:
-            _reinstate()
 
     for i, article in enumerate(sampled):
         miner_analysis = article.analysis
@@ -1831,17 +1757,6 @@ def validate_miner_article_intelligence_batch(
 
         ref = (reference_by_id or {}).get(str(getattr(article, "id", "")))
         src = ref or article
-        is_confirm = confirm is not None and confirm["index"] == i
-        # Only our own copy can show a defect; a miner's copy could be blanked to dodge.
-        defect = defective_text(getattr(ref, "content", None)) if ref is not None else ""
-        if defect:
-            # The article, not the miner: neither passed nor failed, and replaced.
-            skipped += 1
-            defective_ids.append(str(getattr(article, "id", "")))
-            bt.logging.warning(f"[V2_VALIDATE] {defect} article {getattr(article, 'id', '')}; "
-                               f"sample set aside hk={miner_hotkey}")
-            _replace(is_confirm)
-            continue
         validator_intel = analyzer.analyze(
             article_id=article.id,
             url=src.url,
@@ -1853,11 +1768,7 @@ def validate_miner_article_intelligence_batch(
             raw_html=getattr(src, "raw_html", None),
         )
         if validator_intel is None:
-            # No usable reference: the sample is neither passed nor failed.
-            skipped += 1
-            bt.logging.warning(f"[V2_VALIDATE] no reference for {getattr(article, 'id', '')}; "
-                               f"sample skipped hk={miner_hotkey}")
-            _replace(is_confirm)
+            discrepancies.append({"article_index": i, "reason": "validator_analysis_failed"})
             continue
 
         try:
@@ -1870,38 +1781,17 @@ def validate_miner_article_intelligence_batch(
             agreement = _summary_agreement(miner_intel, validator_intel)
             if agreement is not None:
                 bt.logging.info(f"[V2_VALIDATE] summary_agreement={agreement:.3f} id={getattr(article, 'id', '')} hk={miner_hotkey}")
-                floor_gate = float(_cfg_get("SUMMARY_AGREEMENT_FLOOR", 0.4))
-                if is_confirm and agreement < confirm_floor:
-                    _reinstate()
-                if agreement < floor_gate:
-                    disc = {
+                if agreement < float(_cfg_get("SUMMARY_AGREEMENT_FLOOR", 0.4)):
+                    discrepancies.append({
                         "article_index": i,
                         "resource_id": str(getattr(article, "id", "")),
                         "reason": "article_content_mismatch",
                         "article_preview": (getattr(src, "title", "") or "")[:100],
                         "summary_agreement": agreement,   # display-only: how close vs the 0.40 floor
-                    }
-                    if (marginal_allowed and not marginal_used and not is_confirm
-                            and agreement >= band_low and spares and not llm_spend.paused()):
-                        # Close to the gate: a second sample decides, at a stricter bar.
-                        marginal_used = True
-                        skipped += 1
-                        sampled.append(spares.pop())
-                        confirm = {"index": len(sampled) - 1, "discrepancy": disc}
-                        bt.logging.info(f"[V2_VALIDATE] marginal mismatch {agreement:.3f}; "
-                                        f"confirming on a second sample hk={miner_hotkey}")
-                        continue
-                    discrepancies.append(disc)
+                    })
                     continue
-            elif is_confirm:
-                _reinstate()
 
         is_valid, composite, details = validate_article_intelligence(miner_intel, validator_intel)
-        if is_confirm and confirm is not None:
-            if is_valid:
-                confirm = None            # cleared: the first sample was a close call
-            else:
-                _reinstate()
         if is_valid:
             matches += 1
             total_composite += composite
@@ -1963,7 +1853,6 @@ def validate_miner_article_intelligence_batch(
         budget = 2 * cap
         picked = 0
         spent = 0
-        failed = 0
         for article in _keyed_order(auditor, miner_batch):
             if picked >= cap or spent >= budget:
                 bt.logging.debug(
@@ -1994,15 +1883,12 @@ def validate_miner_article_intelligence_batch(
                                 schema_cutover_block=schema_cutover_block).get(aid):
                 continue
 
+            spent += 1
             try:
                 validator_intel = _reference_analysis(analyzer, auditor, article, src,
                                                       int(block))
                 if validator_intel is None:
-                    failed += 1
-                    if failed >= AUDIT_MAX_FAILED_REFERENCES:
-                        break
                     continue
-                spent += 1
                 result = oracle_floor.evaluate(miner_intel, text)
                 observed = auditor.audit(aid, text, miner_intel, validator_intel,
                                          result, int(block))
@@ -2029,14 +1915,7 @@ def validate_miner_article_intelligence_batch(
         if ad and isinstance(ad, dict):
             te = ad.get("title_embedding")
             if te and isinstance(te, list) and len(te) == EMBEDDING_DIM:
-                try:
-                    vec = np.array(te, dtype=np.float32)
-                except (TypeError, ValueError):
-                    vec = None
-                if vec is None or not np.all(np.isfinite(vec)):
-                    discrepancies.append({"article_index": idx, "reason": "malformed_analysis"})
-                    continue
-                indexed.append((idx, article, vec))
+                indexed.append((idx, article, np.array(te, dtype=np.float32)))
 
     if len(indexed) >= 3:
         for a in range(len(indexed)):
@@ -2070,22 +1949,16 @@ def validate_miner_article_intelligence_batch(
                     "cosine": miner_cos,
                 })
 
-    _reinstate()      # a confirmation that never reached a verdict leaves the first result
-    graded = len(sampled) - skipped
-    no_verdict = graded == 0 and len(sampled) > 0 and not discrepancies
-    batch_valid = matches == graded and len(discrepancies) == 0 and not no_verdict
+    batch_valid = matches == sample_size and len(discrepancies) == 0
     avg_composite = total_composite / max(matches, 1)
 
     result = {
-        "is_valid": batch_valid, "matches": matches, "total_sampled": graded,
-        "skipped_samples": skipped, "no_verdict": no_verdict,
+        "is_valid": batch_valid, "matches": matches, "total_sampled": sample_size,
         "avg_composite_score": round(avg_composite, 4), "discrepancies": discrepancies,
         "observations": observations,
         "faithfulness_scores": faithfulness_scores,
         "reference_irrelevant": reference_irrelevant,
         "floor_results": floor_results,
-        "defective_ids": defective_ids,
-        "marginal_used": marginal_used,
         "floor_quality": batch_floor_quality(floor_stats),
         "audit_observations": audit_observations,
     }

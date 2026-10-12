@@ -19,7 +19,7 @@ TORCH_INDEX="${TORCH_INDEX:-https://download.pytorch.org/whl/cu128}"
 # shellcheck disable=SC1091
 source .venv/bin/activate
 
-python -m pip install --upgrade pip setuptools wheel
+python -m pip install --upgrade "pip>=23.0" "setuptools>=68,<82" wheel
 
 echo ">> Installing PyTorch ($TORCH_INDEX)"
 pip install "torch>=2" --index-url "$TORCH_INDEX"

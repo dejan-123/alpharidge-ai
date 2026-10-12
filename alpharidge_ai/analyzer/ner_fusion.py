@@ -13,14 +13,28 @@ Loads all models once at startup, processes articles in ~0.9s:
 
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 import os
 import re
+import time
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
 logger = logging.getLogger("ner_fusion")
+
+
+@contextmanager
+def _log_time(label: str):
+    t0 = time.perf_counter()
+    yield
+    logger.info(f"[NER] {label} took {(time.perf_counter() - t0) * 1000:.1f}ms")
+
+
+def _gpu_guard(gpu_lock):
+    return gpu_lock if gpu_lock is not None else contextlib.nullcontext()
 DATA_DIR = os.path.join(os.path.dirname(__file__), "data")
 
 # Cap on extracted clean text fed to the NER models (after boilerplate removal).
@@ -77,6 +91,9 @@ class NERFusionEngine:
     def __init__(self, enable_refined: bool = True, enable_flair: bool = True,
                  enable_gliner: bool = True, enable_finbert: bool = True,
                  enable_multilingual: bool = True):
+        # Patch curated-transformers FIRST so prefer_gpu()/flair.device work.
+        NERFusionEngine._patch_curated_transformers_for_gpu()
+
         # Pin cuDNN/cuBLAS/RNG before any model loads so miner and validator get
         # reproducible neural output (shrinks cross-run GPU jitter; no quality cost).
         from .determinism import configure_determinism
@@ -89,21 +106,19 @@ class NERFusionEngine:
         self._asset_extractor = AssetExtractor()
         self._entity_filter = EntityFilter()
 
-        # spaCy — always loaded (lightweight, fast)
+        # spaCy — always loaded; prefer_gpu() routes the transformer to CUDA
+        # (curated-transformers input tensor device mismatch is fixed by the
+        # _patch_curated_transformers_for_gpu() call above).
         import spacy
-        try:
-            import cupy as _cp
-            int(_cp.arange(4).sum())  # smoke-test: cupy kernels must actually run on this GPU/driver
-            _gpu_ok = spacy.prefer_gpu()  # route spaCy/thinc transformer NER to GPU
-            logger.info(f"[NER] spaCy GPU enabled: {_gpu_ok}")
-        except Exception as _e:
-            logger.warning(f"[NER] spaCy on CPU (cupy/GPU unusable: {type(_e).__name__}); torch models still use GPU")
         try:
             import torch as _torch
             self._cuda = bool(getattr(_torch, "cuda", None) and _torch.cuda.is_available())
         except Exception:
             self._cuda = False
         logger.info(f"[NER] CUDA available for NER models: {self._cuda}")
+        if getattr(self, "_cuda", False):
+            _gpu_ok = spacy.prefer_gpu()
+            logger.info(f"[NER] spaCy GPU enabled: {_gpu_ok}")
         logger.info("[NER] Loading spaCy en_core_web_trf...")
         self._nlp = spacy.load("en_core_web_trf")
         logger.info("[NER] spaCy loaded")
@@ -128,7 +143,12 @@ class NERFusionEngine:
         self._flair_tagger = None
         if enable_flair:
             try:
+                import flair as _flair
+                import torch as _torch
                 from flair.models import SequenceTagger
+                if getattr(self, "_cuda", False):
+                    _flair.device = _torch.device("cuda")
+                    logger.info("[NER] Flair device set to CUDA")
                 logger.info("[NER] Loading Flair OntoNotes...")
                 self._flair_tagger = SequenceTagger.load("flair/ner-english-ontonotes-large")
                 logger.info("[NER] Flair loaded")
@@ -180,6 +200,9 @@ class NERFusionEngine:
                 self._refined = Refined.from_pretrained(model_name="aida_model", entity_set="wikidata",
                                                         device="cuda" if getattr(self, "_cuda", False) else "cpu")
                 logger.info("[NER] ReFinED loaded")
+                # ReFinED is slow per call; cache unique (text, label) lookups.
+                self._refined_cache: Dict[tuple, Optional[tuple]] = {}
+                self._refined_cache_maxsize = 8192
             except Exception as e:
                 logger.warning(f"[NER] ReFinED failed to load: {e}")
 
@@ -218,14 +241,73 @@ class NERFusionEngine:
                     f"Embedder={'✓' if self._embedder else '✗'} "
                     f"overrides={len(self._overrides)} qid_map={len(self._qid_map)}")
 
-    def encode_text(self, text: str) -> Optional[List[float]]:
+    def encode_text(self, text: str, gpu_lock=None) -> Optional[List[float]]:
         """Encode text into a 384-dim L2-normalized embedding vector."""
         if self._embedder is None or not text or not text.strip():
             return None
-        return self._embedder.encode(text.strip(), normalize_embeddings=True).tolist()
+        with _gpu_guard(gpu_lock), _log_time("encode_text"):
+            return self._embedder.encode(text.strip(), normalize_embeddings=True).tolist()
+
+    def encode_texts(self, texts: List[str], normalize_embeddings: bool = True,
+                     gpu_lock=None) -> Optional[List[List[float]]]:
+        """Encode a batch of texts into L2-normalized embedding vectors."""
+        if self._embedder is None or not texts:
+            return []
+        with _gpu_guard(gpu_lock), _log_time("encode_texts"):
+            return self._embedder.encode(list(texts), normalize_embeddings=normalize_embeddings).tolist()
+
+    @staticmethod
+    def _patch_curated_transformers_for_gpu() -> None:
+        """Move curated-transformers BertEmbeddings inputs to the model's device.
+
+        curated-transformers 0.1.1 creates input_ids on CPU even when model
+        weights are on CUDA.  Patching only BertEmbeddings is sufficient:
+        RobertaEmbeddings.forward delegates to self.inner (a BertEmbeddings),
+        so both spaCy en_core_web_trf (RoBERTa) and Flair (XLM-RoBERTa) are
+        covered by this single patch.
+        NOTE: RobertaEmbeddings has no word_embeddings attribute directly
+        (it lives in self.inner) — patching RobertaEmbeddings would AttributeError.
+        """
+        import torch as _torch
+
+        def _to_device(t, device):
+            if isinstance(t, _torch.Tensor):
+                return t.to(device, non_blocking=True)
+            return t
+
+        try:
+            from curated_transformers.models.bert.embeddings import BertEmbeddings
+            _orig_bert = BertEmbeddings.forward
+
+            def _bert_forward(self, input_ids, token_type_ids=None, position_ids=None):
+                dev = self.word_embeddings.weight.device
+                return _orig_bert(
+                    self,
+                    _to_device(input_ids, dev),
+                    _to_device(token_type_ids, dev) if token_type_ids is not None else None,
+                    _to_device(position_ids, dev) if position_ids is not None else None,
+                )
+
+            BertEmbeddings.forward = _bert_forward
+
+            from curated_transformers.models.attention import ScaledDotProductAttention
+            _orig_sdpa = ScaledDotProductAttention.forward
+
+            def _sdpa_forward(self, k, q, v, attn_mask):
+                dev = q.device
+                if hasattr(attn_mask, "bool_mask") and attn_mask.bool_mask.device != dev:
+                    attn_mask.bool_mask = attn_mask.bool_mask.to(dev, non_blocking=True)
+                    attn_mask._logit_mask = None  # reset so logit_mask regenerates on GPU
+                return _orig_sdpa(self, k, q, v, attn_mask)
+
+            ScaledDotProductAttention.forward = _sdpa_forward
+            logger.info("[NER] Patched curated-transformers BertEmbeddings + ScaledDotProductAttention for GPU")
+        except Exception as e:
+            logger.warning(f"[NER] Could not patch curated-transformers for GPU: {e}")
 
     def extract_and_resolve(self, title: str, body: str,
-                            raw_html: Optional[str] = None) -> NERResult:
+                            raw_html: Optional[str] = None,
+                            gpu_lock=None) -> NERResult:
         """Full NER pipeline: clean -> detect language -> language-routed
         candidate generation -> confidence/blocklist/offset filtering ->
         resolution. Deterministic end to end.
@@ -239,75 +321,81 @@ class NERFusionEngine:
 
         # 1. Detect language on the raw text (robust to boilerplate); drives
         #    both routing and the language-aware content extractor.
-        lang = detect_language(f"{title}\n{body}").code
-        result = NERResult(detected_language=lang)
+        with _log_time("detect_language_and_clean"):
+            lang = detect_language(f"{title}\n{body}").code
+            result = NERResult(detected_language=lang)
 
-        # 0. Remove site chrome (share bars, CTAs, photo credits, nav) before
-        #    anything sees the text — kills §3.1/§3.3 boilerplate leakage.
-        #    HTML (raw_html) -> trafilatura; plain text -> jusText-style + relevance.
-        clean_title = clean_text(title)
-        source = raw_html if (raw_html and raw_html.strip()) else body
-        clean_body = self._content_extractor.extract(source, lang, title=title)[:_MAX_CLEAN_CHARS]
-        full_text = f"{clean_title}\n{clean_body}"
+            # 0. Remove site chrome (share bars, CTAs, photo credits, nav) before
+            #    anything sees the text — kills §3.1/§3.3 boilerplate leakage.
+            #    HTML (raw_html) -> trafilatura; plain text -> jusText-style + relevance.
+            clean_title = clean_text(title)
+            source = raw_html if (raw_html and raw_html.strip()) else body
+            clean_body = self._content_extractor.extract(source, lang, title=title)[:_MAX_CLEAN_CHARS]
+            full_text = f"{clean_title}\n{clean_body}"
 
         # 2. Keyword asset extraction (now language-aware + on cleaned text).
-        asset_matches = self._asset_extractor.extract_assets(clean_title, clean_body, language=lang)
-        for m in asset_matches:
-            result.resolved_assets.append(ResolvedEntity(
-                text=m.evidence_spans[0] if m.evidence_spans else m.ticker,
-                canonical_name=m.asset_name,
-                entity_type="asset",
-                ticker=m.ticker,
-                asset_class=m.asset_class,
-                confidence=m.disambiguation_confidence,
-                source="keyword",
-                is_primary_subject=m.is_primary_subject,
-                surface_forms=list(dict.fromkeys((m.evidence_spans or []) + [m.asset_name])),
-            ))
+        with _log_time("asset_extraction"):
+            asset_matches = self._asset_extractor.extract_assets(clean_title, clean_body, language=lang)
+            for m in asset_matches:
+                result.resolved_assets.append(ResolvedEntity(
+                    text=m.evidence_spans[0] if m.evidence_spans else m.ticker,
+                    canonical_name=m.asset_name,
+                    entity_type="asset",
+                    ticker=m.ticker,
+                    asset_class=m.asset_class,
+                    confidence=m.disambiguation_confidence,
+                    source="keyword",
+                    is_primary_subject=m.is_primary_subject,
+                    surface_forms=list(dict.fromkeys((m.evidence_spans or []) + [m.asset_name])),
+                ))
 
         # 3. spaCy always runs for MONEY/PERCENT/DATE spans (numeric, language
         #    -tolerant); its entity spans only feed the English path.
-        doc = self._nlp(full_text)
-        for ent in doc.ents:
-            if ent.label_ == "MONEY":
-                result.money_values.append({"text": ent.text, "start": ent.start_char, "end": ent.end_char})
-            elif ent.label_ == "PERCENT":
-                result.percentages.append({"text": ent.text, "start": ent.start_char, "end": ent.end_char})
-            elif ent.label_ == "DATE":
-                result.dates.append({"text": ent.text, "start": ent.start_char, "end": ent.end_char})
+        with _gpu_guard(gpu_lock), _log_time("spacy_ner"):
+            doc = self._nlp(full_text)
+            for ent in doc.ents:
+                if ent.label_ == "MONEY":
+                    result.money_values.append({"text": ent.text, "start": ent.start_char, "end": ent.end_char})
+                elif ent.label_ == "PERCENT":
+                    result.percentages.append({"text": ent.text, "start": ent.start_char, "end": ent.end_char})
+                elif ent.label_ == "DATE":
+                    result.dates.append({"text": ent.text, "start": ent.start_char, "end": ent.end_char})
 
         # 4. Language-routed entity candidate generation + grounding.
-        candidates = self._generate_candidates(full_text, lang, doc)
-        grounded = self._entity_filter.filter(candidates, lang)
+        with _gpu_guard(gpu_lock), _log_time("generate_candidates"):
+            candidates = self._generate_candidates(full_text, lang, doc, gpu_lock=gpu_lock)
+            grounded = self._entity_filter.filter(candidates, lang)
 
         # 5. Resolve each grounded candidate to canonical form.
-        seen_tickers = {e.ticker for e in result.resolved_assets if e.ticker}
-        for c in grounded:
-            resolved = self._resolve_entity(c.text, c.label, c.model, c.score, c.start, c.end)
-            if resolved:
-                if resolved.ticker and resolved.ticker not in seen_tickers:
-                    seen_tickers.add(resolved.ticker)
-                    result.resolved_assets.append(resolved)
-                elif resolved.entity_type != "asset":
-                    result.resolved_entities.append(resolved)
+        with _log_time("resolve_entities"):
+            seen_tickers = {e.ticker for e in result.resolved_assets if e.ticker}
+            for resolved in self._resolve_grounded(grounded, gpu_lock=gpu_lock):
+                if resolved:
+                    if resolved.ticker and resolved.ticker not in seen_tickers:
+                        seen_tickers.add(resolved.ticker)
+                        result.resolved_assets.append(resolved)
+                    elif resolved.entity_type != "asset":
+                        result.resolved_entities.append(resolved)
 
         # 6. FinBERT sentence sentiments (on cleaned text).
         if self._finbert:
-            # Split on sentence punctuation OR newlines, but NOT on decimals
-            # ("$94.8" must stay intact) — target-aware ABSA downstream needs whole
-            # sentences with the asset named, not fragments truncated at a decimal.
-            sentences = [s.strip() for s in re.split(r"(?<!\d)[.!?]+(?!\d)\s+|\n+", full_text)
-                         if len(s.strip()) > 20]
-            for sent in sentences[:20]:
+            with _gpu_guard(gpu_lock), _log_time("finbert_sentiment"):
+                # Split on sentence punctuation OR newlines, but NOT on decimals
+                # ("$94.8" must stay intact) — target-aware ABSA downstream needs whole
+                # sentences with the asset named, not fragments truncated at a decimal.
+                sentences = [s.strip() for s in re.split(r"(?<!\d)[.!?]+(?!\d)\s+|\n+", full_text)
+                             if len(s.strip()) > 20]
                 try:
-                    fb_result = self._finbert(sent, truncation=True, max_length=512)[0]
-                    label = fb_result["label"].lower()
-                    direction = "bullish" if label == "positive" else "bearish" if label == "negative" else "neutral"
-                    result.sentence_sentiments.append({
-                        "text": sent[:200],
-                        "sentiment": direction,
-                        "score": fb_result["score"],
-                    })
+                    batch = sentences[:20]
+                    fb_results = self._finbert(batch, truncation=True, max_length=512)
+                    for sent, fb_result in zip(batch, fb_results):
+                        label = fb_result["label"].lower()
+                        direction = "bullish" if label == "positive" else "bearish" if label == "negative" else "neutral"
+                        result.sentence_sentiments.append({
+                            "text": sent[:200],
+                            "sentiment": direction,
+                            "score": fb_result["score"],
+                        })
                 except Exception:
                     pass
 
@@ -323,7 +411,8 @@ class NERFusionEngine:
     # WikiNEuRal -> spaCy-style label normalization (MISC dropped as noise).
     _WIKINEURAL_MAP = {"PER": "PERSON", "ORG": "ORG", "LOC": "GPE"}
 
-    def _generate_candidates(self, full_text: str, language: str, doc) -> List["Candidate"]:
+    def _generate_candidates(self, full_text: str, language: str, doc,
+                              gpu_lock=None) -> List["Candidate"]:
         """Route to English or multilingual NER backends and return candidates.
 
         English: spaCy + GLiNER + Flair. Non-English: WikiNEuRal multilingual +
@@ -340,7 +429,9 @@ class NERFusionEngine:
                                            ent.label_, "spacy", 0.75))
             if self._gliner:
                 try:
-                    for ge in self._gliner.predict_entities(full_text, self._GLINER_LABELS, threshold=0.4):
+                    with _gpu_guard(gpu_lock), _log_time("gliner_predict"):
+                        ge_list = self._gliner.predict_entities(full_text, self._GLINER_LABELS, threshold=0.4)
+                    for ge in ge_list:
                         cands.append(Candidate(ge["text"], ge["start"], ge["end"],
                                                ge["label"], "gliner", float(ge["score"])))
                 except Exception as e:
@@ -349,7 +440,8 @@ class NERFusionEngine:
                 try:
                     from flair.data import Sentence
                     fs = Sentence(full_text)
-                    self._flair_tagger.predict(fs)
+                    with _gpu_guard(gpu_lock), _log_time("flair_predict"):
+                        self._flair_tagger.predict(fs)
                     for ent in fs.get_spans("ner"):
                         if ent.tag in ("PERSON", "ORG"):
                             cands.append(Candidate(ent.text, ent.start_position, ent.end_position,
@@ -367,7 +459,9 @@ class NERFusionEngine:
         else:
             if self._wikineural:
                 try:
-                    for ne in self._wikineural(full_text):
+                    with _gpu_guard(gpu_lock), _log_time("wikineural_predict"):
+                        ne_list = self._wikineural(full_text)
+                    for ne in ne_list:
                         label = self._WIKINEURAL_MAP.get(ne.get("entity_group"))
                         if label:
                             cands.append(Candidate(ne["word"], int(ne["start"]), int(ne["end"]),
@@ -376,7 +470,9 @@ class NERFusionEngine:
                     logger.debug(f"[NER] WikiNEuRal predict failed: {e}")
             if self._gliner_multi:
                 try:
-                    for ge in self._gliner_multi.predict_entities(full_text, self._GLINER_LABELS, threshold=0.4):
+                    with _gpu_guard(gpu_lock), _log_time("gliner_multi_predict"):
+                        ge_list = self._gliner_multi.predict_entities(full_text, self._GLINER_LABELS, threshold=0.4)
+                    for ge in ge_list:
                         cands.append(Candidate(ge["text"], ge["start"], ge["end"],
                                                ge["label"], "gliner_multi", float(ge["score"])))
                 except Exception as e:
@@ -385,7 +481,8 @@ class NERFusionEngine:
         return cands
 
     def _resolve_entity(self, text: str, label: str, source: str,
-                        conf: float, start: int, end: int) -> Optional[ResolvedEntity]:
+                        conf: float, start: int, end: int,
+                        gpu_lock=None) -> Optional[ResolvedEntity]:
         """Resolve a raw NER entity to canonical form."""
         key = text.lower().strip()
 
@@ -406,33 +503,51 @@ class NERFusionEngine:
         # Step 2: ReFinED entity linking
         if self._refined:
             try:
-                spans = self._refined.process_text(text)
-                for span in spans:
-                    if span.predicted_entity and span.predicted_entity.wikidata_entity_id:
-                        qid = span.predicted_entity.wikidata_entity_id
-                        if qid in self._qid_map:
-                            info = self._qid_map[qid]
-                            return ResolvedEntity(
-                                text=text,
-                                canonical_name=info.get("name", span.predicted_entity.wikipedia_entity_title or text),
-                                entity_type=info.get("type", "unknown"),
-                                ticker=info.get("ticker"),
-                                asset_class=info.get("asset_class"),
-                                wikidata_qid=qid,
-                                role=info.get("role"),
-                                confidence=0.9, source="refined",
-                                start=start, end=end,
-                            )
-                        # QID found but not in our map — use Wikipedia title
-                        wiki_title = span.predicted_entity.wikipedia_entity_title
-                        if wiki_title:
-                            etype = self._infer_type_from_label(label)
-                            return ResolvedEntity(
-                                text=text, canonical_name=wiki_title,
-                                entity_type=etype, wikidata_qid=qid,
-                                confidence=0.7, source="refined",
-                                start=start, end=end,
-                            )
+                cache_key = (text.lower().strip(), label)
+                with _gpu_guard(gpu_lock), _log_time("refined_resolve"):
+                    cached = self._refined_cache.get(cache_key)
+                    if cached is None and cache_key not in self._refined_cache:
+                        spans = self._refined.process_text(text)
+                        cached = None
+                        for span in spans:
+                            if span.predicted_entity and span.predicted_entity.wikidata_entity_id:
+                                qid = span.predicted_entity.wikidata_entity_id
+                                if qid in self._qid_map:
+                                    info = self._qid_map[qid]
+                                    cached = (
+                                        info.get("name", span.predicted_entity.wikipedia_entity_title or text),
+                                        info.get("type", "unknown"),
+                                        info.get("ticker"),
+                                        info.get("asset_class"),
+                                        qid,
+                                        info.get("role"),
+                                        0.9,
+                                        "refined",
+                                    )
+                                    break
+                                if not cached:
+                                    wiki_title = span.predicted_entity.wikipedia_entity_title
+                                    if wiki_title:
+                                        etype = self._infer_type_from_label(label)
+                                        cached = (wiki_title, etype, None, None, qid, None, 0.7, "refined")
+                                        break
+                        if len(self._refined_cache) >= self._refined_cache_maxsize:
+                            # Evict an arbitrary entry to cap memory.
+                            self._refined_cache.pop(next(iter(self._refined_cache)))
+                        self._refined_cache[cache_key] = cached
+                    if cached is not None:
+                        return ResolvedEntity(
+                            text=text,
+                            canonical_name=cached[0],
+                            entity_type=cached[1],
+                            ticker=cached[2],
+                            asset_class=cached[3],
+                            wikidata_qid=cached[4],
+                            role=cached[5],
+                            confidence=cached[6],
+                            source=cached[7],
+                            start=start, end=end,
+                        )
             except Exception:
                 pass
 
@@ -442,6 +557,132 @@ class NERFusionEngine:
             text=text, canonical_name=text, entity_type=etype,
             confidence=conf, source=source, start=start, end=end,
         )
+
+    def _resolve_grounded(self, grounded: List["Candidate"], gpu_lock=None) -> List[Optional[ResolvedEntity]]:
+        """Resolve grounded candidates. Overrides first, then cache, then a single batched ReFinED call."""
+        if not grounded:
+            return []
+        resolved: List[Optional[ResolvedEntity]] = [None] * len(grounded)
+        cache = getattr(self, "_refined_cache", None)
+        cache_max = getattr(self, "_refined_cache_maxsize", 8192)
+        refined = self._refined
+
+        batch_texts: List[str] = []
+        batch_idx: List[int] = []
+        batch_keys: List[tuple] = []
+
+        for i, c in enumerate(grounded):
+            override_key = c.text.lower().strip()
+            if override_key in self._overrides:
+                info = self._overrides[override_key]
+                resolved[i] = ResolvedEntity(
+                    text=c.text, canonical_name=info["canonical"],
+                    entity_type=info["type"],
+                    ticker=info.get("ticker"), asset_class=info.get("asset_class"),
+                    wikidata_qid=info.get("wikidata"), role=info.get("role"),
+                    confidence=1.0, source="override",
+                    start=c.start, end=c.end,
+                )
+                continue
+
+            if refined is None or cache is None:
+                etype = self._infer_type_from_label(c.label)
+                resolved[i] = ResolvedEntity(
+                    text=c.text, canonical_name=c.text, entity_type=etype,
+                    confidence=c.score, source=c.model, start=c.start, end=c.end,
+                )
+                continue
+
+            cache_key = (c.text, c.label)
+            cached = cache.get(cache_key)
+            if cached is not None or cache_key in cache:
+                if cached is not None:
+                    resolved[i] = ResolvedEntity(
+                        text=c.text, canonical_name=cached[0], entity_type=cached[1],
+                        ticker=cached[2], asset_class=cached[3], wikidata_qid=cached[4],
+                        role=cached[5], confidence=cached[6], source=cached[7],
+                        start=c.start, end=c.end,
+                    )
+                else:
+                    etype = self._infer_type_from_label(c.label)
+                    resolved[i] = ResolvedEntity(
+                        text=c.text, canonical_name=c.text, entity_type=etype,
+                        confidence=c.score, source=c.model, start=c.start, end=c.end,
+                    )
+                continue
+
+            batch_texts.append(c.text)
+            batch_idx.append(i)
+            batch_keys.append(cache_key)
+
+        if batch_texts and refined is not None and cache is not None:
+            with _gpu_guard(gpu_lock), _log_time("refined_batch"):
+                try:
+                    docs = refined.process_text_batch(batch_texts, max_batch_size=8)
+                except Exception as e:
+                    logger.debug(f"[NER] ReFinED batch failed: {e}")
+                    docs = []
+
+            for text, doc, idx, key in zip(batch_texts, docs, batch_idx, batch_keys):
+                cache_value: Optional[tuple] = None
+                try:
+                    for span in doc.spans:
+                        pred = getattr(span, "predicted_entity", None)
+                        if pred and getattr(pred, "wikidata_entity_id", None):
+                            qid = pred.wikidata_entity_id
+                            if qid in self._qid_map:
+                                info = self._qid_map[qid]
+                                cache_value = (
+                                    info.get("name", pred.wikipedia_entity_title or text),
+                                    info.get("type", "unknown"),
+                                    info.get("ticker"),
+                                    info.get("asset_class"),
+                                    qid,
+                                    info.get("role"),
+                                    0.9,
+                                    "refined",
+                                )
+                            else:
+                                wiki_title = pred.wikipedia_entity_title
+                                if wiki_title:
+                                    etype = self._infer_type_from_label(grounded[idx].label)
+                                    cache_value = (wiki_title, etype, None, None, qid, None, 0.7, "refined")
+                            break
+                except Exception:
+                    pass
+
+                if len(cache) >= cache_max:
+                    cache.pop(next(iter(cache)))
+                cache[key] = cache_value
+
+                if cache_value is not None:
+                    resolved[idx] = ResolvedEntity(
+                        text=text, canonical_name=cache_value[0], entity_type=cache_value[1],
+                        ticker=cache_value[2], asset_class=cache_value[3], wikidata_qid=cache_value[4],
+                        role=cache_value[5], confidence=cache_value[6], source=cache_value[7],
+                        start=grounded[idx].start, end=grounded[idx].end,
+                    )
+                else:
+                    etype = self._infer_type_from_label(grounded[idx].label)
+                    resolved[idx] = ResolvedEntity(
+                        text=text, canonical_name=text, entity_type=etype,
+                        confidence=grounded[idx].score, source=grounded[idx].model,
+                        start=grounded[idx].start, end=grounded[idx].end,
+                    )
+
+            # If batch failed partially, fall back the remainder.
+            for j in range(len(docs), len(batch_texts)):
+                idx = batch_idx[j]
+                key = batch_keys[j]
+                c = grounded[idx]
+                cache[key] = None
+                etype = self._infer_type_from_label(c.label)
+                resolved[idx] = ResolvedEntity(
+                    text=c.text, canonical_name=c.text, entity_type=etype,
+                    confidence=c.score, source=c.model, start=c.start, end=c.end,
+                )
+
+        return resolved
 
     def _infer_type_from_label(self, label: str) -> str:
         """Map NER labels to our entity type system."""

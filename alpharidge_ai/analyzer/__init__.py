@@ -82,7 +82,19 @@ def setup_article_intelligence_analyzer() -> ArticleIntelligenceAnalyzer:
     Uses model/api_key/llm_base from config (loaded from .miner_env / .vali_env).
     Loads all data files (assets, contagion templates, narratives, dependency graph, source profiles).
 
+    When NLP_SERVER_URL is set in the environment the analyzer is wired to a
+    RemoteNEREngine that calls the centralised GPU server for Stage 1 inference
+    (NER + embeddings).  Each miner still calls the LLM API with its own API_KEY
+    for Stage 2 / Stage 3.  If NLP_SERVER_URL is empty the original local
+    NERFusionEngine is used (single-miner / validator mode).
+
     Returns:
         Configured ArticleIntelligenceAnalyzer instance
     """
+    nlp_url = getattr(config, "NLP_SERVER_URL", "")
+    if nlp_url:
+        from alpharidge_ai.analyzer.remote_ner import RemoteNEREngine
+        timeout = float(getattr(config, "NLP_SERVER_TIMEOUT", 120.0))
+        remote_engine = RemoteNEREngine(server_url=nlp_url, timeout=timeout)
+        return ArticleIntelligenceAnalyzer(ner_engine=remote_engine)
     return ArticleIntelligenceAnalyzer()

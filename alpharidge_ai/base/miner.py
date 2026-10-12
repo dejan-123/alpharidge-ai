@@ -141,7 +141,7 @@ class BaseMinerNeuron(BaseNeuron):
         try:
             while not self.should_exit:
                 while (
-                    self.block - self.metagraph.last_update[self.uid]
+                    self.block - getattr(self, "_last_sync_block", 0)
                     < self.config.neuron.epoch_length
                 ):
                     # Wait before checking again.
@@ -213,9 +213,18 @@ class BaseMinerNeuron(BaseNeuron):
         """
         self.stop_run_thread()
 
+    def should_sync_metagraph(self):
+        # metagraph.last_update only advances when this UID serves an extrinsic,
+        # so it stays stale forever after startup and would resync every loop.
+        # Track our own last-sync block instead.
+        return (
+            self.block - getattr(self, "_last_sync_block", 0)
+        ) > self.config.neuron.epoch_length
+
     def resync_metagraph(self):
         """Resyncs the metagraph and updates the hotkeys and moving averages based on the new metagraph."""
         bt.logging.info("resync_metagraph()")
 
         # Sync the metagraph.
         self.metagraph.sync(subtensor=self.subtensor)
+        self._last_sync_block = self.block
