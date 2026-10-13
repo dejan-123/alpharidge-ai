@@ -410,6 +410,13 @@ TIER3_JUNK_FILTER = _as_bool(os.getenv("TIER3_JUNK_FILTER", "true"))
 REFERENCE_PROVIDER_ORDER = os.getenv("REFERENCE_PROVIDER_ORDER", "")
 REFERENCE_PROVIDER_IGNORE = os.getenv("REFERENCE_PROVIDER_IGNORE", "")
 REFERENCE_PROVIDER_MAX_PRICE = os.getenv("REFERENCE_PROVIDER_MAX_PRICE", "")
+# Miner-side OpenRouter routing + resilience. Miner-local envs, never served by
+# remote config (validators keep REFERENCE_* above).
+MINER_PROVIDER_IGNORE     = os.getenv("MINER_PROVIDER_IGNORE", "")
+MINER_PROVIDER_ORDER      = os.getenv("MINER_PROVIDER_ORDER", "")
+MINER_PROVIDER_MAX_PRICE  = os.getenv("MINER_PROVIDER_MAX_PRICE", "")
+MODEL_FALLBACK            = os.getenv("MODEL_FALLBACK", "")
+MINER_CALL1_MAX_TOKENS    = int(os.getenv("MINER_CALL1_MAX_TOKENS", "8192"))
 REPUTATION_PEERS = os.getenv("REPUTATION_PEERS", "")
 REFERENCE_TOOL_AUTO = _as_bool(os.getenv("REFERENCE_TOOL_AUTO", "true"))
 

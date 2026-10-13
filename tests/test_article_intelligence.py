@@ -1169,16 +1169,27 @@ class TestHybridValidationContract:
         assert not ok and comp == 0.0
         assert details["tier1"]["primary_sector_id"]["match"] is False
 
+    @staticmethod
+    def _eth_link():
+        return ContagionLink(source_ticker="ETH", target_ticker="STETH",
+                             target_asset_class=AssetClass.CRYPTO,
+                             mechanism=ContagionMechanism.PROTOCOL_DEPENDENCY,
+                             direction=SentimentDirection.NEUTRAL, strength=0.7, confidence=0.7,
+                             reasoning="dependency_graph")
+
     def test_contagion_determinism_gate(self):
-        miner = _make_intel(contagion_links=[
-            ContagionLink(source_ticker="ETH", target_ticker="STETH",
-                          target_asset_class=AssetClass.CRYPTO,
-                          mechanism=ContagionMechanism.PROTOCOL_DEPENDENCY,
-                          direction=SentimentDirection.NEUTRAL, strength=0.7, confidence=0.7,
-                          reasoning="dependency_graph")])
-        validator = _make_intel()  # no contagion links
+        validator = _make_intel(contagion_links=[self._eth_link()])
+        miner = _make_intel()  # omits the reference's links
         ok, comp, details = validate_article_intelligence(miner, validator)
         assert not ok and details["tier2"]["contagion_determinism"]["jaccard"] < 0.9
+
+    def test_contagion_is_not_judged_without_reference_links(self):
+        miner = _make_intel(contagion_links=[self._eth_link()])
+        ok, comp, details = validate_article_intelligence(miner, _make_intel())
+        assert details["tier2"]["contagion_determinism"]["reference_links"] == 0
+        assert "contagion" not in str(details.get("tier2", {}).get("fail_reason", ""))
+        same = validate_article_intelligence(_make_intel(), _make_intel())
+        assert ok == same[0]
 
     @staticmethod
     def _nvda(direction):
@@ -1237,7 +1248,9 @@ class TestHybridValidationContract:
         import alpharidge_ai.analyzer.scoring as S
         assert S.TIER3_THRESHOLD == 0.70
 
-    def test_threshold_gates_exactly_at_composite(self):
+    def test_threshold_gates_exactly_at_composite(self, monkeypatch):
+        from alpharidge_ai import config as _c
+        monkeypatch.setattr(_c, "TIER3_JUNK_FILTER", False, raising=False)
         # The accept/reject boundary tracks the SERVED threshold. The module constant
         # in scoring.py is only a fallback for when config cannot be read, so patching
         # it proves nothing about what a validator actually does.
@@ -1256,7 +1269,9 @@ class TestHybridValidationContract:
                 cfg.TIER3_THRESHOLD = orig
         assert ok_lo and not ok_hi
 
-    def test_recalibration_rescues_honest_noise_pair(self):
+    def test_recalibration_rescues_honest_noise_pair(self, monkeypatch):
+        from alpharidge_ai import config as _c
+        monkeypatch.setattr(_c, "TIER3_JUNK_FILTER", False, raising=False)
         # A pair the old 0.75 floor rejected but 0.70 accepts -> the whole point.
         from alpharidge_ai import config as cfg
         miner, validator = self._noisy_miner(), _make_intel(narrative_keywords=["fed-policy"])

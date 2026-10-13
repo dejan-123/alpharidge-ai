@@ -48,6 +48,7 @@ from alpharidge_ai.analyzer.llm_cache import LLMCache
 from alpharidge_ai.analyzer.aspect_sentiment import AspectSentimentScorer, score_assets
 from alpharidge_ai.analyzer.horizon import reconcile_direction_with_horizons
 from alpharidge_ai.oracle import floor as oracle_floor
+from alpharidge_ai.utils import llm_spend
 
 try:
     from alpharidge_ai import config
@@ -56,6 +57,10 @@ except ImportError:
 
 DATA_DIR = os.path.join(os.path.dirname(__file__), "data")
 MAX_CONTENT_CHARS = 3000
+
+
+class ReferenceUnavailable(Exception):
+    """A validator-side call returned nothing usable, so there is no reference to grade against."""
 
 
 def count_entity_mentions(text: str, forms: List[str]) -> tuple:
@@ -433,6 +438,9 @@ class ArticleIntelligenceAnalyzer:
         self._aspect_scorer = AspectSentimentScorer(device="cpu")
         self.source_profiles = _load_json("source_profiles.json").get("profiles", {})
         self.dependency_graph = _load_json("dependency_graph.json").get("dependencies", {})
+        if not self.dependency_graph:
+            bt.logging.error("[ARTICLE_INTEL] dependency_graph.json is missing or empty: "
+                             "no contagion links will be built. Restore it from the repository.")
         self._init_narrative_index()
 
         bt.logging.info(f"[ARTICLE_INTEL] Ready: model={self.model} endpoint={self.llm_base}")
@@ -516,13 +524,18 @@ class ArticleIntelligenceAnalyzer:
         published: Optional[str] = None, summary: Optional[str] = None,
         content: Optional[str] = None, miner_hotkey: Optional[str] = None,
         raw_html: Optional[str] = None, reference: bool = False,
-        model: Optional[str] = None,
+        model: Optional[str] = None, deadline: Optional[float] = None,
     ) -> Optional[ArticleIntelligence]:
         """Analyse one article.
 
         `reference=True` is the validator's audit reference: extraction only, and
         cached per article, model and content so every audit of an article is scored
         against the same result.
+
+        `deadline` (epoch seconds, time.time() scale) bounds LLM work: calls
+        started past it raise ReferenceUnavailable immediately, so a batch
+        under time pressure degrades to a safe label instead of missing its
+        lease. None (default) = no limit, preserving all other callers.
         """
         key = None
         if reference and miner_hotkey is None:
@@ -532,7 +545,8 @@ class ArticleIntelligenceAnalyzer:
             if cached is not None:
                 return cached.model_copy()
         result = self._analyze(article_id, url, title, source, published, summary,
-                               content, miner_hotkey, raw_html, reference, model)
+                               content, miner_hotkey, raw_html, reference, model,
+                               deadline)
         if key is not None and result is not None:
             self._reference_cache.put(key, result.model_copy())
         return result
@@ -546,7 +560,7 @@ class ArticleIntelligenceAnalyzer:
         self, article_id: int, url: str, title: str, source: str,
         published: Optional[str], summary: Optional[str], content: Optional[str],
         miner_hotkey: Optional[str], raw_html: Optional[str], reference: bool,
-        model: Optional[str] = None,
+        model: Optional[str] = None, deadline: Optional[float] = None,
     ) -> Optional[ArticleIntelligence]:
         start_ms = int(time.time() * 1000)
         model = model or self.model
@@ -593,8 +607,20 @@ class ArticleIntelligenceAnalyzer:
                 f"Article:\n\"\"\"{article_text}\"\"\"\n\n"
                 f"Pre-detected (NER):\n{ner_hints}"
             )
+            # Call-1 emits ~20 required fields incl. per-claim arrays — 4000 tokens
+            # truncated on verbose upstreams (finish_reason=length). The budget is
+            # env-tunable; asking for more also lets OpenRouter filter out
+            # upstreams that cannot emit that much.
+            call1_max_tokens = int(getattr(config, "MINER_CALL1_MAX_TOKENS", 8192)
+                                   if config else 8192)
             call1 = self._llm_call(call1_prompt, EXTRACT_CLASSIFY_TOOL, "extract_and_classify",
-                                   model, timeout=45.0, max_tokens=4000)
+                                   model, strict=miner_hotkey is None,
+                                   purpose="reference:audit" if reference else "reference:tier3",
+                                   timeout=45.0, max_tokens=call1_max_tokens, deadline=deadline)
+            if not call1:
+                # {} after retries = no usable extraction; the all-defaults assembly
+                # would crater the Tier-3 composite and risk a summary mismatch.
+                raise ReferenceUnavailable("extract_and_classify: empty after retries")
 
             # Merge additional tickers from LLM. Also log the gap between what
             # the LLM knows and what the gazetteer found — measuring this on
@@ -621,7 +647,10 @@ class ArticleIntelligenceAnalyzer:
                 )
                 call2 = self._llm_call(call2_prompt, REASON_SUMMARIZE_TOOL,
                                        "reason_and_summarize", model,
-                                       timeout=20.0, max_tokens=1500)
+                                       strict=miner_hotkey is None, purpose="reference:tier3",
+                                       timeout=20.0, max_tokens=1500, deadline=deadline)
+                if not call2:
+                    raise ReferenceUnavailable("reason_and_summarize: empty after retries")
 
             # ── ASSEMBLY ──
             # Contagion + per-asset sentiment are computed off-LLM from the DETERMINISTIC
@@ -745,6 +774,9 @@ class ArticleIntelligenceAnalyzer:
                            f"{len(assets)} assets, {len(entities)} entities")
             return result
 
+        except ReferenceUnavailable as e:
+            bt.logging.warning(f"[ARTICLE_INTEL] No reference for article {article_id}: {e}")
+            return None
         except Exception as e:
             bt.logging.error(f"[ARTICLE_INTEL] Failed article {article_id}: {e}")
             bt.logging.error(f"[ARTICLE_INTEL] {traceback.format_exc()}")
@@ -808,37 +840,83 @@ class ArticleIntelligenceAnalyzer:
     # ========================================================================
 
     def _llm_call(self, prompt: str, tool: dict, tool_name: str,
-                  model: Optional[str] = None, timeout: float = 45.0,
-                  max_tokens: int = 4000) -> dict:
-        # One retry on transient failures (empty tool calls, API errors): a failed
-        # call1 silently produces an all-defaults analysis that mismatches the
-        # validator's completed reference on every compared field.
+                  model: Optional[str] = None, strict: bool = False,
+                  purpose: str = "reference:tier3", timeout: float = 45.0,
+                  max_tokens: int = 4000, deadline: Optional[float] = None) -> dict:
+        """One forced tool call. A miner's call returns {} when the model gives nothing
+        usable. A validator's (`strict`) call is retried once and then raises
+        ReferenceUnavailable, so a failed call is never graded against as a reference.
+
+        `deadline` (epoch seconds) aborts any attempt started past it with
+        ReferenceUnavailable — the caller degrades to its safe path instead of
+        stacking more doomed latency onto a batch under time pressure."""
+        extra = {}
+        if strict:
+            body = llm_spend.request_body(self.client)
+        else:
+            # Miner calls: attach the miner's own provider routing prefs. Without
+            # this the miner's REFERENCE_PROVIDER_IGNORE-style envs never reached
+            # OpenRouter and bad upstreams (truncation, malformed tool calls)
+            # kept getting selected.
+            body = llm_spend.miner_body(self.client)
+        if body:
+            extra["extra_body"] = body
+        problem = ""
+        if strict and llm_spend.paused():
+            raise ReferenceUnavailable(f"{tool_name}: paused")
+        own_model = (model or self.model) == self.model
         for attempt in range(2):
+            if deadline is not None and time.time() > deadline:
+                raise ReferenceUnavailable(f"{tool_name}: deadline exceeded")
+            auto = strict and own_model and attempt == 0 and llm_spend.auto_tools()
+            response = None
+            started = time.time()
             try:
                 response = self.client.chat.completions.create(
                     model=model or self.model,
-                    messages=[{"role": "user", "content": prompt}],
+                    messages=[{"role": "user", "content": llm_spend.ask_for_tool(prompt, tool_name, auto)}],
                     tools=[tool],
-                    tool_choice={"type": "function", "function": {"name": tool_name}},
+                    tool_choice=llm_spend.tool_choice(tool_name, auto),
                     temperature=0,
                     max_tokens=max_tokens,
                     timeout=timeout,
+                    **extra,
                 )
-                tc = response.choices[0].message.tool_calls
-                if not tc:
-                    bt.logging.warning(f"[ARTICLE_INTEL] {tool_name}: no tool calls returned")
-                    if attempt == 0:
-                        time.sleep(1.0)
-                        continue
-                    return {}
-                return json.loads(tc[0].function.arguments)
+                if strict:
+                    llm_spend.record(purpose, model or self.model, response,
+                                     time.time() - started)
+                choice = response.choices[0]
+                tc = choice.message.tool_calls
+                if getattr(choice, "finish_reason", None) == "length":
+                    problem = "cut off at max_tokens"
+                elif not tc:
+                    problem = "no tool calls returned"
+                else:
+                    parsed = json.loads(tc[0].function.arguments)
+                    if auto:
+                        llm_spend.note_auto(True)
+                    return parsed
             except Exception as e:
-                bt.logging.warning(f"[ARTICLE_INTEL] {tool_name} failed: {e}")
+                if strict and llm_spend.is_key_limit(e):
+                    llm_spend.pause(e)
+                    raise ReferenceUnavailable(f"{tool_name}: key limit")
+                problem = f"failed: {e}"
+            if auto:
+                llm_spend.note_auto(False)
+                bt.logging.debug(f"[ARTICLE_INTEL] {tool_name}: {problem}; asking again")
+                continue
+            detail = ""
+            if response is not None:
+                first = (getattr(response, "choices", None) or [None])[0]
+                detail = (f" (provider={getattr(response, 'provider', None)}, "
+                          f"finish_reason={getattr(first, 'finish_reason', None)})")
+            bt.logging.warning(f"[ARTICLE_INTEL] {tool_name}: {problem}{detail}")
+            if not strict:
                 if attempt == 0:
                     time.sleep(1.0)
                     continue
                 return {}
-        return {}
+        raise ReferenceUnavailable(f"{tool_name}: {problem}")
 
     # ========================================================================
     # Fact Sheet Builder (compact input for LLM Call 2)
@@ -884,14 +962,15 @@ class ArticleIntelligenceAnalyzer:
         econ = call1.get("economic_data", [])
         if econ:
             parts = []
-            for d in econ[:5]:
+            for d in [d for d in econ if isinstance(d, dict)][:5]:
                 actual = f"{d.get('actual_value', '?')}" if d.get("actual_value") is not None else "?"
                 parts.append(f"{d.get('event_name', '?')}: {actual} {d.get('unit', '')}")
             lines.append("Economic Data: " + " | ".join(parts))
         quotes = call1.get("quotes", [])
         if quotes:
             for q in quotes[:2]:
-                lines.append(f"Quote: {q.get('speaker', '?')}: \"{q.get('text', '')[:100]}\"")
+                q = q if isinstance(q, dict) else {"text": str(q)}
+                lines.append(f"Quote: {q.get('speaker', '?')}: \"{str(q.get('text', ''))[:100]}\"")
         sents = ner_result.sentence_sentiments[:3]
         if sents:
             lines.append("FinBERT hints: " + ", ".join(f"{s['sentiment']}({s['score']:.2f})" for s in sents))

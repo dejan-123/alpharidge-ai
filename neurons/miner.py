@@ -9,7 +9,9 @@ import time
 import typing
 import threading
 import unicodedata
+import queue
 from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timezone
 import copy
 import asyncio
 import bittensor as bt
@@ -17,6 +19,17 @@ import bittensor as bt
 # Max concurrent background processing threads per miner process.
 # Keeps CPU/thread count bounded while still overlapping I/O.
 _MAX_MINER_WORKERS = int(os.environ.get("MINER_MAX_WORKERS", "4"))
+
+# Wall-clock budget for per-article LLM work inside one batch. Articles that
+# can't finish in time are emitted as safe 'irrelevant' claims instead of
+# burning the whole batch past the validator's ~900s lease (540s is the
+# on-time growth gate; 400s leaves margin for post-processing + send).
+_MINER_ARTICLE_DEADLINE_S = float(os.environ.get("MINER_ARTICLE_DEADLINE_S", "400"))
+
+# Failed batch pushes are retried on a background queue until this long after
+# dispatch — just inside the validator's ~900s lease window.
+_RESEND_EXPIRY_S = float(os.environ.get("MINER_RESEND_EXPIRY_S", "800"))
+_RESEND_BACKOFF_S = 30.0
 
 # Bittensor Miner Template:
 import alpharidge_ai
@@ -33,7 +46,7 @@ from alpharidge_ai.models.article_intelligence import SCHEMA_VERSION
 from alpharidge_ai.triage import (
     FLAG_DISCARD, FLAG_VALUABLE, LABEL_BORDERLINE, LABEL_IRRELEVANT,
     LABEL_RELEVANT, TRIAGE_SCHEMA_VERSION, analysis_indicates_value,
-    build_triage_record)
+    build_proof_of_read, build_triage_record, gazetteer_assets)
 
 # Must precede every model load — see install_meta_init_guard. A miner that loses the
 # race returns nothing for the affected articles and earns no points for them.
@@ -62,6 +75,89 @@ def _analysis_is_doomed(intel, content: str) -> bool:
     schema-valid thin analysis can still pass the sampled composite and earn
     credit, while a blob is a discrepancy whenever it is sampled."""
     return intel.title_embedding is None or intel.body_embedding is None
+
+
+def _polish_for_audit(intel, article_text: str):
+    """Run the validator's deterministic floor check on our own output and fix
+    what would hurt the audit_v2 reputation channel (F1 x calibration).
+
+    - Ungrounded claims (floor regex finds no matching number in the text)
+      cannot be rescued by adjudication — the adjudicator must cite a verbatim
+      span — so they sit in the precision denominator with no numerator support
+      AND can carry a high-confidence calibration penalty. Drop them.
+    - Rejected quotes (unaligned/overlapping/number-mismatch) become ("qx", i)
+      unsupported keys — the same dead weight. Drop them.
+    - Inferred claims go to the adjudicator — a coin flip. Cap their confidence
+      at neutral (0.5) so a denied claim costs log(0.5) instead of log(1-conf).
+    - Grounded (literal) claims are left untouched: high confidence on a correct
+      claim is rewarded.
+
+    Drops also raise floor_quality (claim grounding + quote alignment rates),
+    which feeds the floor channel. Tier-1/2/2.5 gates never look at claims or
+    quotes, so raw score is unaffected.
+    """
+    from alpharidge_ai.oracle import floor as oracle_floor
+    try:
+        result = oracle_floor.evaluate(intel, article_text)
+
+        claims = list(intel.numeric_claims or [])
+        dropped_ung = capped_inf = 0
+        new_claims = []
+        for i, claim in enumerate(claims):
+            if i in result.ungrounded:
+                dropped_ung += 1
+                continue
+            conf = getattr(claim, "confidence", None)
+            if i in result.inferred and conf is not None and conf > 0.5:
+                claim = claim.model_copy(update={"confidence": 0.5})
+                capped_inf += 1
+            new_claims.append(claim)
+
+        quotes = list(intel.quotes or [])
+        new_quotes = [q for i, q in enumerate(quotes)
+                      if i not in result.rejected_quotes]
+        dropped_rej = len(quotes) - len(new_quotes)
+
+        if dropped_ung or dropped_rej or capped_inf:
+            bt.logging.info(
+                f"[POLISH] article {intel.article_id}: dropped {dropped_ung} "
+                f"ungrounded claims, {dropped_rej} rejected quotes, "
+                f"capped confidence on {capped_inf} inferred claims")
+            intel = intel.model_copy(update={"numeric_claims": new_claims,
+                                             "quotes": new_quotes})
+        return intel
+    except Exception:
+        return intel  # conservative: submit unchanged when the check itself fails
+
+
+def _default_tweet_analysis() -> TweetAnalysisBase:
+    """Neutral placeholder for a tweet that could not be classified.
+
+    An item with analysis=None is left unsigned and is a guaranteed
+    discrepancy whenever the validator samples it; a signed default is
+    only a discrepancy when the validator produced something else."""
+    return TweetAnalysisBase(
+        sentiment="neutral",
+        content_type="other",
+        technical_quality="none",
+        market_analysis="other",
+        impact_potential="NONE",
+    )
+
+
+def _default_telegram_analysis(message_id: str) -> TelegramMessageAnalysis:
+    """Neutral placeholder for a message that could not be classified."""
+    return TelegramMessageAnalysis(
+        id=0,
+        message_id=message_id,
+        sentiment="neutral",
+        content_type="other",
+        technical_quality="none",
+        market_analysis="other",
+        impact_potential="NONE",
+        relevance_confidence="low",
+        analyzed_at=datetime.now(timezone.utc).isoformat(),
+    )
 
 
 class Miner(BaseMinerNeuron):
@@ -118,10 +214,25 @@ class Miner(BaseMinerNeuron):
             max_workers=_MAX_MINER_WORKERS,
             thread_name_prefix="miner-bg",
         )
+        # Article batches occupy their outer worker for the whole per-item map,
+        # so they get their own pool — long article jobs can't starve the
+        # tweet/telegram loops that share `_executor`.
+        self._article_outer_executor = ThreadPoolExecutor(
+            max_workers=int(os.environ.get("MINER_ARTICLE_OUTER_WORKERS", "2")),
+            thread_name_prefix="miner-articles",
+        )
         self._article_executor = ThreadPoolExecutor(
             max_workers=int(os.environ.get("MINER_ARTICLE_WORKERS", "8")),
             thread_name_prefix="miner-article",
         )
+
+        # Resend queue: batch pushes that exhaust their two attempts are
+        # retried here until the lease window closes — a transient failure
+        # must not silently drop a fully-processed batch.
+        self._resend_queue = queue.Queue()
+        threading.Thread(
+            target=self._resend_worker, daemon=True, name="miner-resend",
+        ).start()
 
         # IMPORTANT: Register a concrete TweetBatch handler on the axon.
         # Bittensor routes requests by synapse class name; attaching only `forward(self, bt.Synapse)`
@@ -151,7 +262,109 @@ class Miner(BaseMinerNeuron):
 
     def _validator_send_lock(self, validator_hotkey: str) -> threading.Lock:
         with self._send_locks_guard:
+            # Bounded by validator count; a clear at an absurd ceiling avoids
+            # unbounded growth on a pathological stream of distinct hotkeys.
+            if len(self._send_locks) >= 4096:
+                self._send_locks.clear()
             return self._send_locks.setdefault(validator_hotkey, threading.Lock())
+
+    def _attempt_send(self, synapse, validator_hotkey: str, label: str, t0: float) -> bool:
+        """One dendrite push to the validator; True on HTTP 200."""
+        try:
+            validator_uid = self.metagraph.hotkeys.index(validator_hotkey)
+        except ValueError:
+            validator_uid = None
+            bt.logging.error(f"[Miner] Validator hotkey {validator_hotkey} not found in metagraph")
+        if validator_uid is None:
+            return False
+        validator_axon = self.metagraph.axons[validator_uid]
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        dendrite = None
+        try:
+            dendrite = bt.Dendrite(wallet=self.wallet)
+            with self._validator_send_lock(validator_hotkey):
+                responses = loop.run_until_complete(
+                    dendrite.forward(
+                        axons=[validator_axon],
+                        synapse=synapse,
+                        timeout=30.0,
+                        deserialize=True,
+                    )
+                )
+            try:
+                status_code = responses[0].dendrite.status_code if responses and responses[0].dendrite else None
+                status_msg = responses[0].dendrite.status_message if responses and responses[0].dendrite else None
+            except Exception:
+                status_code, status_msg = None, None
+            total_ms = (time.perf_counter() - t0) * 1000
+            if status_code == 200:
+                bt.logging.info(
+                    f"[Miner] Sent {label} back to validator {validator_hotkey} "
+                    f"in {total_ms:.1f} ms")
+                return True
+            bt.logging.error(f"[Miner] {label} send failed (status={status_code}): {status_msg} "
+                             f"total={total_ms:.1f} ms")
+            return False
+        except Exception as e:
+            bt.logging.error(f"[Miner] Failed to send {label} to validator: {e}")
+            return False
+        finally:
+            try:
+                if dendrite is not None:
+                    if hasattr(dendrite, "aclose_session"):
+                        loop.run_until_complete(dendrite.aclose_session())
+                    elif hasattr(dendrite, "close_session"):
+                        dendrite.close_session()
+            except Exception:
+                pass
+            loop.close()
+
+    def _send_processed_batch(self, synapse, validator_hotkey: str, label: str, t0: float):
+        """Push a processed batch back to the validator; on failure, resync the
+        metagraph and try once more — the axon may have moved mid-epoch. The
+        per-validator lock keeps dendrite nonces ordered across both attempts,
+        and validator-side idempotent rewarding makes a doubly-landed batch safe.
+        Exhausted pushes go to the resend worker, which retries until the
+        lease window closes."""
+        for attempt in range(2):
+            if self._attempt_send(synapse, validator_hotkey, label, t0):
+                return
+            if attempt == 0:
+                # Stale axon or transient failure: refresh before the single retry.
+                try:
+                    self.metagraph.sync()
+                except Exception as e:
+                    bt.logging.warning(f"[Miner] Metagraph resync before retry failed: {e}")
+        expiry = t0 + _RESEND_EXPIRY_S
+        if time.perf_counter() < expiry:
+            bt.logging.info(f"[Miner] {label} to {validator_hotkey} queued for resend")
+            self._resend_queue.put((synapse, validator_hotkey, label, t0, expiry))
+
+    def _resend_worker(self):
+        """Retry failed batch pushes with backoff until the lease window
+        closes, then drop — a batch that lands past the lease earns nothing."""
+        while True:
+            item = self._resend_queue.get()
+            if item is None:
+                return
+            synapse, validator_hotkey, label, t0, expiry = item
+            while True:
+                remaining = expiry - time.perf_counter()
+                if remaining <= 0:
+                    bt.logging.warning(
+                        f"[Miner] {label} resend expired for validator {validator_hotkey}")
+                    break
+                time.sleep(min(_RESEND_BACKOFF_S, remaining))
+                if self._attempt_send(synapse, validator_hotkey, label, t0):
+                    break
+
+    def stop_run_thread(self):
+        try:
+            self._resend_queue.put(None)
+        except Exception:
+            pass
+        super().stop_run_thread()
 
     async def blacklist_tweet_batch(
         self, synapse: alpharidge_ai.protocol.TweetBatch
@@ -272,7 +485,7 @@ class Miner(BaseMinerNeuron):
 
         synapse_copy = copy.deepcopy(synapse)
 
-        self._executor.submit(self._process_and_send_articles, synapse_copy, validator_hotkey)
+        self._article_outer_executor.submit(self._process_and_send_articles, synapse_copy, validator_hotkey)
 
         bt.logging.info(f"[Miner] Started background processing for ArticleBatch, returning immediately")
         return synapse
@@ -289,28 +502,40 @@ class Miner(BaseMinerNeuron):
             t0 = time.perf_counter()
             bt.logging.info(f"[Miner] Background: Processing {len(synapse.tweet_batch)} tweets")
             
-            # Process each tweet
+            # Process each tweet. A per-item failure must not abort the batch:
+            # an analysis-less item is left unsigned and is a guaranteed
+            # discrepancy whenever the validator samples it, so failures get a
+            # neutral default and the send below still goes out.
             for tweet in synapse.tweet_batch:
-                if not tweet.text:
-                    bt.logging.warning(f"[Miner] Skipping tweet {tweet.id} - no text content")
-                    continue
-                
-                # Classify the tweet
-                classification = self.analyzer.classify_post(tweet.text)
-                
-                if classification is None:
-                    bt.logging.warning(f"[Miner] Failed to classify tweet {tweet.id}")
-                    continue
-                
-                tweet.analysis = TweetAnalysisBase(
-                    sentiment=classification.sentiment.value,
-                    asset_id=classification.asset_id,
-                    asset_symbol=classification.asset_symbol,
-                    content_type=classification.content_type.value,
-                    technical_quality=classification.technical_quality.value,
-                    market_analysis=classification.market_analysis.value,
-                    impact_potential=classification.impact_potential.value,
-                )
+                try:
+                    if not tweet.text:
+                        bt.logging.warning(f"[Miner] Tweet {tweet.id} has no text, submitting default analysis")
+                        tweet.analysis = _default_tweet_analysis()
+                        continue
+
+                    classification = self.analyzer.classify_post(tweet.text)
+                    if classification is None:
+                        # One retry — a transient analyzer failure is otherwise
+                        # a guaranteed miss if this item is sampled.
+                        classification = self.analyzer.classify_post(tweet.text)
+                    if classification is None:
+                        bt.logging.warning(f"[Miner] Failed to classify tweet {tweet.id}, submitting default analysis")
+                        tweet.analysis = _default_tweet_analysis()
+                        continue
+
+                    tweet.analysis = TweetAnalysisBase(
+                        sentiment=classification.sentiment.value,
+                        asset_id=classification.asset_id,
+                        asset_symbol=classification.asset_symbol,
+                        content_type=classification.content_type.value,
+                        technical_quality=classification.technical_quality.value,
+                        market_analysis=classification.market_analysis.value,
+                        impact_potential=classification.impact_potential.value,
+                    )
+                except Exception as e:
+                    bt.logging.error(f"[Miner] Tweet {tweet.id} processing failed: {e}")
+                    if getattr(tweet, "analysis", None) is None:
+                        tweet.analysis = _default_tweet_analysis()
             
             process_ms = (time.perf_counter() - t0) * 1000
             bt.logging.info(f"[Miner] Background: Finished processing {len(synapse.tweet_batch)} tweets "
@@ -321,57 +546,7 @@ class Miner(BaseMinerNeuron):
             synapse.miner_signatures = miner_signatures
             synapse.nonces = nonces
 
-            # Find validator UID and axon info from metagraph
-            try:
-                validator_uid = self.metagraph.hotkeys.index(validator_hotkey)
-            except ValueError:
-                bt.logging.error(f"[Miner] Validator hotkey {validator_hotkey} not found in metagraph")
-                return
-
-            validator_axon = self.metagraph.axons[validator_uid]
-            bt.logging.info(f"[Miner] Background: Found validator UID {validator_uid}, sending response via dendrite")
-
-            # Send the processed batch back to the validator
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-            dendrite = None
-            try:
-                dendrite = bt.Dendrite(wallet=self.wallet)
-                with self._validator_send_lock(validator_hotkey):
-                    responses = loop.run_until_complete(
-                        dendrite.forward(
-                            axons=[validator_axon],
-                            synapse=synapse,
-                            timeout=30.0,
-                            deserialize=True,
-                        )
-                    )
-                try:
-                    status_code = responses[0].dendrite.status_code if responses and responses[0].dendrite else None
-                    status_msg = responses[0].dendrite.status_message if responses and responses[0].dendrite else None
-                except Exception:
-                    status_code, status_msg = None, None
-                total_ms = (time.perf_counter() - t0) * 1000
-                if status_code != 200:
-                    bt.logging.error(f"[Miner] Background: Validator response failed (status={status_code}): {status_msg} "
-                                     f"total={total_ms:.1f} ms")
-                else:
-                    bt.logging.info(
-                        f"[Miner] Background: Successfully sent processed TweetBatch back to validator {validator_hotkey} "
-                        f"in {total_ms:.1f} ms"
-                    )
-            except Exception as e:
-                bt.logging.error(f"[Miner] Background: Failed to send response to validator: {e}")
-            finally:
-                try:
-                    if dendrite is not None:
-                        if hasattr(dendrite, "aclose_session"):
-                            loop.run_until_complete(dendrite.aclose_session())
-                        elif hasattr(dendrite, "close_session"):
-                            dendrite.close_session()
-                except Exception:
-                    pass
-                loop.close()
+            self._send_processed_batch(synapse, validator_hotkey, "TweetBatch", t0)
                 
         except Exception as e:
             bt.logging.error(f"[Miner] Background: Error processing tweets: {e}")
@@ -388,53 +563,65 @@ class Miner(BaseMinerNeuron):
             t0 = time.perf_counter()
             bt.logging.info(f"[Miner] Background: Processing {len(synapse.message_batch)} telegram messages")
             
-            # Process each message
+            # Process each message — same isolation rules as tweets: no item is
+            # left without analysis, and one failure never aborts the send.
             for msg in synapse.message_batch:
-                if not msg.content:
-                    bt.logging.warning(f"[Miner] Skipping telegram message {msg.id} - no content")
-                    continue
-                
-                # Build message dict for analyzer
-                messages_for_analysis = [{
-                    'message_id': msg.id,
-                    'username': msg.sender_username or msg.sender_name,
-                    'content': msg.content,
-                }]
-                
-                # Add context messages if available
-                if msg.context_messages:
-                    for ctx in msg.context_messages:
-                        messages_for_analysis.insert(0, {
-                            'message_id': ctx.id,
-                            'username': ctx.sender_username or ctx.sender_name,
-                            'content': ctx.content,
-                        })
-                
-                inherited_asset_id = msg.inherited_asset_id
-                
-                classification = self.telegram_analyzer.classify_message_group(
-                    messages_for_analysis, 
-                    asset_id=inherited_asset_id
-                )
-                
-                if classification is None:
-                    bt.logging.warning(f"[Miner] Failed to classify telegram message {msg.id}")
-                    continue
-                
-                from datetime import datetime
-                msg.analysis = TelegramMessageAnalysis(
-                    id=0,
-                    message_id=msg.id,
-                    sentiment=classification.sentiment.value,
-                    asset_id=classification.asset_id,
-                    asset_symbol=classification.asset_symbol,
-                    content_type=classification.content_type.value,
-                    technical_quality=classification.technical_quality.value,
-                    market_analysis=classification.market_analysis.value,
-                    impact_potential=classification.impact_potential.value,
-                    relevance_confidence=classification.relevance_confidence,
-                    analyzed_at=datetime.now().isoformat(),
-                )
+                try:
+                    if not msg.content:
+                        bt.logging.warning(f"[Miner] Telegram message {msg.id} has no content, submitting default analysis")
+                        msg.analysis = _default_telegram_analysis(msg.id)
+                        continue
+
+                    # Build message dict for analyzer
+                    messages_for_analysis = [{
+                        'message_id': msg.id,
+                        'username': msg.sender_username or msg.sender_name,
+                        'content': msg.content,
+                    }]
+
+                    # Add context messages if available
+                    if msg.context_messages:
+                        for ctx in msg.context_messages:
+                            messages_for_analysis.insert(0, {
+                                'message_id': ctx.id,
+                                'username': ctx.sender_username or ctx.sender_name,
+                                'content': ctx.content,
+                            })
+
+                    inherited_asset_id = msg.inherited_asset_id
+
+                    classification = self.telegram_analyzer.classify_message_group(
+                        messages_for_analysis,
+                        asset_id=inherited_asset_id
+                    )
+                    if classification is None:
+                        classification = self.telegram_analyzer.classify_message_group(
+                            messages_for_analysis,
+                            asset_id=inherited_asset_id
+                        )
+
+                    if classification is None:
+                        bt.logging.warning(f"[Miner] Failed to classify telegram message {msg.id}, submitting default analysis")
+                        msg.analysis = _default_telegram_analysis(msg.id)
+                        continue
+
+                    msg.analysis = TelegramMessageAnalysis(
+                        id=0,
+                        message_id=msg.id,
+                        sentiment=classification.sentiment.value,
+                        asset_id=classification.asset_id,
+                        asset_symbol=classification.asset_symbol,
+                        content_type=classification.content_type.value,
+                        technical_quality=classification.technical_quality.value,
+                        market_analysis=classification.market_analysis.value,
+                        impact_potential=classification.impact_potential.value,
+                        relevance_confidence=classification.relevance_confidence,
+                        analyzed_at=datetime.now(timezone.utc).isoformat(),
+                    )
+                except Exception as e:
+                    bt.logging.error(f"[Miner] Telegram message {msg.id} processing failed: {e}")
+                    if getattr(msg, "analysis", None) is None:
+                        msg.analysis = _default_telegram_analysis(msg.id)
             
             process_ms = (time.perf_counter() - t0) * 1000
             bt.logging.info(f"[Miner] Background: Finished processing {len(synapse.message_batch)} telegram messages "
@@ -445,64 +632,39 @@ class Miner(BaseMinerNeuron):
             synapse.miner_signatures = miner_signatures
             synapse.nonces = nonces
 
-            # Find validator UID and axon info from metagraph
-            try:
-                validator_uid = self.metagraph.hotkeys.index(validator_hotkey)
-            except ValueError:
-                bt.logging.error(f"[Miner] Validator hotkey {validator_hotkey} not found in metagraph")
-                return
-
-            validator_axon = self.metagraph.axons[validator_uid]
-            bt.logging.info(f"[Miner] Background: Found validator UID {validator_uid}, sending telegram response via dendrite")
-
-            # Send the processed batch back to the validator
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-            dendrite = None
-            try:
-                dendrite = bt.Dendrite(wallet=self.wallet)
-                with self._validator_send_lock(validator_hotkey):
-                    responses = loop.run_until_complete(
-                        dendrite.forward(
-                            axons=[validator_axon],
-                            synapse=synapse,
-                            timeout=30.0,
-                            deserialize=True,
-                        )
-                    )
-                try:
-                    status_code = responses[0].dendrite.status_code if responses and responses[0].dendrite else None
-                    status_msg = responses[0].dendrite.status_message if responses and responses[0].dendrite else None
-                except Exception:
-                    status_code, status_msg = None, None
-                total_ms = (time.perf_counter() - t0) * 1000
-                if status_code != 200:
-                    bt.logging.error(f"[Miner] Background: Validator response failed (status={status_code}): {status_msg} "
-                                     f"total={total_ms:.1f} ms")
-                else:
-                    bt.logging.info(
-                        f"[Miner] Background: Successfully sent processed TelegramBatch back to validator {validator_hotkey} "
-                        f"in {total_ms:.1f} ms"
-                    )
-            except Exception as e:
-                bt.logging.error(f"[Miner] Background: Failed to send telegram response to validator: {e}")
-            finally:
-                try:
-                    if dendrite is not None:
-                        if hasattr(dendrite, "aclose_session"):
-                            loop.run_until_complete(dendrite.aclose_session())
-                        elif hasattr(dendrite, "close_session"):
-                            dendrite.close_session()
-                except Exception:
-                    pass
-                loop.close()
+            self._send_processed_batch(synapse, validator_hotkey, "TelegramBatch", t0)
                 
         except Exception as e:
             bt.logging.error(f"[Miner] Background: Error processing telegram messages: {e}")
 
+    def _claim_bearing(self, article) -> bool:
+        """Deterministic claim-likelihood, used only to order processing: a
+        gazetteer asset hit or >=3 parsed numbers. Under deadline pressure the
+        tail of the queue falls back to safe 'irrelevant' labels — that tail
+        should be det-clean content (fee, no event), not an article whose
+        irrelevant claim is a hard false-negative and whose claims would have
+        fed the audit_v2 channel."""
+        from alpharidge_ai.oracle import floor as oracle_floor
+        title = article.title or ""
+        text = article.content or article.summary or ""
+        if not (title or text):
+            return False
+        try:
+            if gazetteer_assets(self.triage_stage._assets, title, text):
+                return True
+            numbers = oracle_floor.parse_numbers(
+                oracle_floor.normalize(text[:8000]).text)
+            return len(numbers) >= 3
+        except Exception:
+            return False
+
     def _process_and_send_articles(self, synapse: alpharidge_ai.protocol.ArticleBatch, validator_hotkey: str):
         try:
             t0 = time.perf_counter()
+            # Wall-clock cutoff for per-article LLM work. Articles that can't
+            # finish in time are emitted as safe 'irrelevant' claims rather
+            # than burning the whole batch past the validator's ~900s lease.
+            batch_deadline = time.time() + _MINER_ARTICLE_DEADLINE_S
             bt.logging.info(f"[Miner] Background: Processing {len(synapse.article_batch)} articles")
 
             # Up to the validator's borderline cap per batch, zero-signal
@@ -513,7 +675,10 @@ class Miner(BaseMinerNeuron):
             # negatives. Excess zero-signal articles go out as irrelevant
             # claims — never deep-validated, and a hard false-negative is
             # impossible without a gazetteer hit on either side.
-            borderline_slots = threading.BoundedSemaphore(3)
+            # Borderline cap tracks the validator's TriageConfig (a released-code
+            # constant), not a hardcoded count.
+            from alpharidge_ai.validator.triage_grader import TriageConfig
+            borderline_slots = threading.BoundedSemaphore(TriageConfig().borderline_cap)
 
             def _process_single_article(article):
                 # NFC-normalise so analysis_data["title"] agrees with the
@@ -521,8 +686,12 @@ class Miner(BaseMinerNeuron):
                 _title = unicodedata.normalize('NFC', article.title or '').strip()
                 if not _title:
                     # Never skip: an absent response fails the size check. A
-                    # titleless article still gets a claim and a proof.
+                    # titleless article still gets a claim and a proof — but
+                    # never a non-irrelevant label, which would go out with a
+                    # triage-only blob and become a sampled discrepancy.
                     rec, proof, _ = self.triage_stage.evaluate("", article.content or "")
+                    if rec["label"] != LABEL_IRRELEVANT:
+                        rec = build_triage_record(LABEL_IRRELEVANT, reason_code="other")
                     article.analysis = NewsArticleAnalysisBase(
                         sentiment="neutral",
                         analysisData={
@@ -557,15 +726,31 @@ class Miner(BaseMinerNeuron):
 
                 # V2: Full ArticleIntelligence analysis
                 if self.article_intel_analyzer is not None:
-                    # One retry on a failed or degraded analysis (transient
+                    # Retries on a failed or degraded analysis (transient
                     # NER/LLM errors surface as None or a thin result). The
                     # last non-None result is kept. Only a missing-embedding
                     # result is doomed (guaranteed Tier-2.5 fail) and goes out
                     # as the minimal blob; an empty-extraction result is still
                     # submitted — thin content often matches a thin reference,
                     # and a blob is a discrepancy whenever it is sampled.
+                    # Claim-bearing articles get one extra attempt on the
+                    # configured fallback model: a failed analysis here goes out
+                    # as an 'irrelevant' claim, which is a deterministic
+                    # false-negative hard event on the triage channel.
                     intel = None
-                    for _attempt in range(2):
+                    fallback_model = os.environ.get("MODEL_FALLBACK", "")
+                    max_attempts = (3 if fallback_model
+                                    and self._claim_bearing(article) else 2)
+                    for _attempt in range(max_attempts):
+                        if _attempt and time.time() > batch_deadline:
+                            bt.logging.warning(
+                                f"[Miner] Article {article.id}: deadline exceeded, "
+                                f"skipping analysis retry")
+                            break
+                        if _attempt == 2:
+                            bt.logging.warning(
+                                f"[Miner] Article {article.id}: retrying with "
+                                f"fallback model {fallback_model}")
                         candidate = self.article_intel_analyzer.analyze(
                             article_id=article.id,
                             url=article.url,
@@ -576,6 +761,8 @@ class Miner(BaseMinerNeuron):
                             content=article.content,
                             raw_html=getattr(article, "raw_html", None),
                             miner_hotkey=self.wallet.hotkey.ss58_address if self.wallet else None,
+                            model=fallback_model if _attempt == 2 else None,
+                            deadline=batch_deadline,
                         )
                         if candidate is None:
                             if _attempt == 0:
@@ -606,21 +793,16 @@ class Miner(BaseMinerNeuron):
                             bt.logging.warning(
                                 f"[Miner] Article {article.id}: retry still degraded, submitting anyway")
                     if intel is None:
-                        # No usable analysis: if the claim was relevant, park it
-                        # in a free borderline slot — an unflagged borderline is
-                        # returned to the pool untouched, while a blob on a
-                        # relevant claim can still be sampled and costs the
-                        # whole batch's credit.
-                        if (triage_rec["label"] == LABEL_RELEVANT
-                                and borderline_slots.acquire(blocking=False)):
+                        # No usable analysis: claim irrelevant with a valid
+                        # proof. 'relevant' with a triage-only blob is a sampled
+                        # discrepancy that rejects the whole batch; an
+                        # unflagged borderline earns 0 and faces the same
+                        # gazetteer false-negative audit anyway. 'irrelevant'
+                        # pays the fee on det-clean articles and bounds the
+                        # damage to one event on gazetteer hits.
+                        if triage_rec["label"] != LABEL_IRRELEVANT:
                             triage_rec = build_triage_record(
-                                LABEL_BORDERLINE, confidence=0.5)
-                            bt.logging.info(
-                                f"[Miner] Article {article.id}: no usable analysis, "
-                                f"downgraded relevant->borderline")
-                        # Send the claim + proof so the batch stays complete.
-                        # The title keeps the validator's title sweep from
-                        # rejecting the batch.
+                                LABEL_IRRELEVANT, reason_code="other")
                         article.analysis = NewsArticleAnalysisBase(
                             sentiment="neutral",
                             analysisData={
@@ -633,6 +815,10 @@ class Miner(BaseMinerNeuron):
                         )
                         return
                     if intel is not None:
+                        # Deterministic pre-submission floor pass: drop claims
+                        # and quotes the validator's own floor would count
+                        # against us on the audit_v2 channel.
+                        intel = _polish_for_audit(intel, article.content or "")
                         analysis_blob = intel.model_dump()
                         if triage_rec["label"] == "borderline":
                             triage_rec["flag"] = (
@@ -677,9 +863,13 @@ class Miner(BaseMinerNeuron):
                             inferredImpacts=[i.model_dump() for i in intel.inferred_impacts] if intel.inferred_impacts else None,
                             analysisData=analysis_blob,
                         )
+                        _cs = intel.chart_summary
+                        _summary_log = (f"\"{(_cs.headline or '')[:80]} | {(_cs.one_liner or '')[:120]}\""
+                                        if _cs is not None else "<none>")
                         bt.logging.info(f"[Miner] V2 analysis complete for article {article.id}: "
                                         f"{len(intel.assets)} assets, {len(intel.entities)} entities, "
-                                        f"{len(intel.contagion_links)} contagion links")
+                                        f"{len(intel.contagion_links)} contagion links | "
+                                        f"summary={_summary_log}")
                         return
 
                 # V1 fallback: original NewsRelevanceAnalyzer
@@ -687,6 +877,21 @@ class Miner(BaseMinerNeuron):
 
                 if classification is None:
                     bt.logging.warning(f"[Miner] Failed to classify article {article.id}")
+                    # Same rule as the V2 failure path: an analysis failure
+                    # never ships a backed-looking non-irrelevant claim.
+                    if triage_rec["label"] != LABEL_IRRELEVANT:
+                        triage_rec = build_triage_record(
+                            LABEL_IRRELEVANT, reason_code="other")
+                    article.analysis = NewsArticleAnalysisBase(
+                        sentiment="neutral",
+                        analysisData={
+                            "schema_version": SCHEMA_VERSION,
+                            "triage_schema_version": TRIAGE_SCHEMA_VERSION,
+                            "title": _title,
+                            "triage": triage_rec,
+                            "proof_of_read": proof,
+                        },
+                    )
                     return
 
                 article.analysis = NewsArticleAnalysisBase(
@@ -700,7 +905,65 @@ class Miner(BaseMinerNeuron):
                     relevance_confidence=classification.relevance_confidence,
                 )
 
-            list(self._article_executor.map(_process_single_article, synapse.article_batch))
+            def _process_single_article_guarded(article):
+                """One bad article must never abort the batch: exceptions land
+                here instead of propagating through executor.map into the outer
+                catch, which would drop the send and time out every item."""
+                try:
+                    _process_single_article(article)
+                    return
+                except Exception as e:
+                    bt.logging.error(f"[Miner] Article {article.id} processing failed: {e}")
+                if getattr(article, "analysis", None) is not None:
+                    return
+                # Fallback blob: a complete response is strictly better than a
+                # missing analysis (size-check fail), but the claim must be
+                # irrelevant — the article carries no analysis payload, so any
+                # non-irrelevant label is unbacked (relevant+blob is a sampled
+                # batch-kill; unflagged borderline earns 0 under the same
+                # gazetteer audit). Re-run triage for the proof; if triage
+                # itself is what failed, submit an 'other'-coded irrelevant
+                # claim with a recomputed proof.
+                try:
+                    _title = unicodedata.normalize('NFC', article.title or '').strip()
+                    try:
+                        triage_rec, proof, _ = self.triage_stage.evaluate(
+                            _title, article.content or "")
+                    except Exception:
+                        triage_rec = build_triage_record(
+                            LABEL_IRRELEVANT, reason_code="other")
+                        proof = build_proof_of_read(_title, article.content or "")
+                    if triage_rec["label"] != LABEL_IRRELEVANT:
+                        triage_rec = build_triage_record(
+                            LABEL_IRRELEVANT, reason_code="other")
+                    article.analysis = NewsArticleAnalysisBase(
+                        sentiment="neutral",
+                        analysisData={
+                            "schema_version": SCHEMA_VERSION,
+                            "triage_schema_version": TRIAGE_SCHEMA_VERSION,
+                            "title": _title,
+                            "triage": triage_rec,
+                            "proof_of_read": proof,
+                        },
+                    )
+                except Exception as e2:
+                    # Absolute last resort — keep the batch complete.
+                    bt.logging.error(f"[Miner] Article {article.id} fallback failed: {e2}")
+                    if getattr(article, "analysis", None) is None:
+                        article.analysis = NewsArticleAnalysisBase(
+                            sentiment="neutral",
+                            analysisData={"schema_version": SCHEMA_VERSION},
+                        )
+
+            # Claim-bearing articles first: if the deadline ever cuts the tail
+            # of the queue, the items falling back to safe 'irrelevant' labels
+            # are det-clean content — not gazetteer hits (hard false-negatives)
+            # or claim-bearing articles that feed audit_v2. The response batch
+            # keeps the validator's original order; only worker scheduling
+            # changes.
+            ordered_batch = sorted(
+                synapse.article_batch, key=self._claim_bearing, reverse=True)
+            list(self._article_executor.map(_process_single_article_guarded, ordered_batch))
             process_ms = (time.perf_counter() - t0) * 1000
             bt.logging.info(f"[Miner] Background: Finished processing {len(synapse.article_batch)} articles "
                             f"in {process_ms:.1f} ms")
@@ -710,55 +973,7 @@ class Miner(BaseMinerNeuron):
             synapse.miner_signatures = miner_signatures
             synapse.nonces = nonces
 
-            try:
-                validator_uid = self.metagraph.hotkeys.index(validator_hotkey)
-            except ValueError:
-                bt.logging.error(f"[Miner] Validator hotkey {validator_hotkey} not found in metagraph")
-                return
-
-            validator_axon = self.metagraph.axons[validator_uid]
-            bt.logging.info(f"[Miner] Background: Found validator UID {validator_uid}, sending article response via dendrite")
-
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-            dendrite = None
-            try:
-                dendrite = bt.Dendrite(wallet=self.wallet)
-                with self._validator_send_lock(validator_hotkey):
-                    responses = loop.run_until_complete(
-                        dendrite.forward(
-                            axons=[validator_axon],
-                            synapse=synapse,
-                            timeout=30.0,
-                            deserialize=True,
-                        )
-                    )
-                try:
-                    status_code = responses[0].dendrite.status_code if responses and responses[0].dendrite else None
-                    status_msg = responses[0].dendrite.status_message if responses and responses[0].dendrite else None
-                except Exception:
-                    status_code, status_msg = None, None
-                total_ms = (time.perf_counter() - t0) * 1000
-                if status_code != 200:
-                    bt.logging.error(f"[Miner] Background: Validator response failed (status={status_code}): {status_msg} "
-                                     f"total={total_ms:.1f} ms")
-                else:
-                    bt.logging.info(
-                        f"[Miner] Background: Successfully sent processed ArticleBatch back to validator {validator_hotkey} "
-                        f"in {total_ms:.1f} ms"
-                    )
-            except Exception as e:
-                bt.logging.error(f"[Miner] Background: Failed to send article response to validator: {e}")
-            finally:
-                try:
-                    if dendrite is not None:
-                        if hasattr(dendrite, "aclose_session"):
-                            loop.run_until_complete(dendrite.aclose_session())
-                        elif hasattr(dendrite, "close_session"):
-                            dendrite.close_session()
-                except Exception:
-                    pass
-                loop.close()
+            self._send_processed_batch(synapse, validator_hotkey, "ArticleBatch", t0)
 
         except Exception as e:
             bt.logging.error(f"[Miner] Background: Error processing articles: {e}")
@@ -922,6 +1137,8 @@ class Miner(BaseMinerNeuron):
     def __exit__(self, exc_type, exc_value, traceback):
         """Clean up when miner exits."""
         self._executor.shutdown(wait=False)
+        self._article_outer_executor.shutdown(wait=False)
+        self._article_executor.shutdown(wait=False)
         super().__exit__(exc_type, exc_value, traceback)
         return False
 

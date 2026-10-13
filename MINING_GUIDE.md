@@ -351,6 +351,20 @@ prevents OOM.
 
 ---
 
+## 9b. Tunable environment variables
+
+| Variable | Default | What it does |
+|---|---|---|
+| `MINER_ARTICLE_DEADLINE_S` | `400` | Per-batch wall-clock budget for article LLM work. Articles that can't finish in time are emitted as safe `irrelevant` claims instead of burning the batch past the validator's ~900s lease. |
+| `MINER_RESEND_EXPIRY_S` | `800` | How long after dispatch the resend worker keeps retrying a failed batch push before dropping it. |
+| `MINER_ARTICLE_WORKERS` | `8` | Concurrent per-article processing threads. |
+| `MINER_ARTICLE_OUTER_WORKERS` | `2` | Concurrent batches processed in parallel. |
+| `MINER_MAX_WORKERS` | `4` | Background threads shared by tweet/telegram loops. |
+
+Set them in `miners.yaml` under the miner's `env:` block (or `.miner_env` for a single-miner setup).
+
+---
+
 ## 10. File reference
 
 | Path | Purpose |

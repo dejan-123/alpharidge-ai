@@ -33,28 +33,56 @@ def usage_body(client) -> dict:
     return {"usage": {"include": True}} if "openrouter" in base else {}
 
 
+def provider_prefs(client, ignore: str = "", order: str = "",
+                   max_price: str = "") -> dict:
+    """The OpenRouter `provider` routing dict, or {} when the client isn't OpenRouter.
+
+    `ignore`/`order` are comma-separated provider slugs; `max_price` is the
+    "prompt,completion" USD pair. `order` implies allow_fallbacks=True so a
+    preferred upstream that errors falls through instead of failing the call.
+    """
+    if "openrouter" not in str(getattr(client, "base_url", "") or "").lower():
+        return {}
+    prefs = {}
+    for key, raw in (("ignore", ignore), ("order", order)):
+        names = [p.strip() for p in str(raw or "").split(",") if p.strip()]
+        if names:
+            prefs[key] = names
+    if "order" in prefs:
+        prefs["allow_fallbacks"] = True
+    cap = [p.strip() for p in str(max_price or "").split(",")]
+    try:
+        if len(cap) == 2:
+            prefs["max_price"] = {"prompt": float(cap[0]), "completion": float(cap[1])}
+    except ValueError:
+        pass
+    return prefs
+
+
 def request_body(client) -> dict:
     """`extra_body` for the validator's own calls: cost accounting and provider routing."""
     body = usage_body(client)
     if not body:
         return {}
     from alpharidge_ai import config
-    prefs = {}
-    for key, name in (("ignore", "REFERENCE_PROVIDER_IGNORE"), ("order", "REFERENCE_PROVIDER_ORDER")):
-        names = [p.strip() for p in str(getattr(config, name, "") or "").split(",") if p.strip()]
-        if names:
-            prefs[key] = names
-    if "order" in prefs:
-        prefs["allow_fallbacks"] = True
-    cap = [p.strip() for p in str(getattr(config, "REFERENCE_PROVIDER_MAX_PRICE", "") or "").split(",")]
-    try:
-        if len(cap) == 2:
-            prefs["max_price"] = {"prompt": float(cap[0]), "completion": float(cap[1])}
-    except ValueError:
-        pass
+    prefs = provider_prefs(client, config.REFERENCE_PROVIDER_IGNORE,
+                           config.REFERENCE_PROVIDER_ORDER,
+                           config.REFERENCE_PROVIDER_MAX_PRICE)
     if prefs:
         body["provider"] = prefs
     return body
+
+
+def miner_body(client) -> dict:
+    """`extra_body` for a miner's calls: provider routing only (no cost accounting)."""
+    try:
+        from alpharidge_ai import config
+    except Exception:
+        config = None
+    prefs = provider_prefs(client, getattr(config, "MINER_PROVIDER_IGNORE", ""),
+                           getattr(config, "MINER_PROVIDER_ORDER", ""),
+                           getattr(config, "MINER_PROVIDER_MAX_PRICE", ""))
+    return {"provider": prefs} if prefs else {}
 
 
 def _cost(response) -> float:

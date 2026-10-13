@@ -46,9 +46,10 @@ _mg_hotkeys: list = []  # populated by _refresh_chain for the subnet scan
 
 def _fleet():
     cfg = yaml.safe_load(CONFIG_FILE.read_text())
+    default_wallet = (cfg.get("global") or {}).get("wallet_name")
     out = []
     for m in cfg.get("miners", []):
-        keyfile = WALLETS_DIR / m["wallet_name"] / "hotkeys" / m["hotkey"]
+        keyfile = WALLETS_DIR / (m.get("wallet_name") or default_wallet) / "hotkeys" / m["hotkey"]
         ss58 = None
         try:
             ss58 = json.loads(keyfile.read_text()).get("ss58Address")

@@ -56,7 +56,8 @@ def test_the_llm_call_uses_the_model_it_is_given():
         chat=types.SimpleNamespace(completions=types.SimpleNamespace(create=create)))
     analyzer._llm_call("p", {}, "t", "model-b")
     analyzer._llm_call("p", {}, "t")
-    assert seen == ["model-b", "default"]
+    # Failed calls retry once, so each _llm_call sends two requests.
+    assert seen == ["model-b", "model-b", "default", "default"]
 
 
 class DrawingAuditor:
