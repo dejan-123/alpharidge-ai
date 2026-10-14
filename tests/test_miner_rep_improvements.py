@@ -314,11 +314,13 @@ def test_verdict_none_without_analyzer(monkeypatch):
 
 
 def test_verdict_delegates_to_judge_keep(monkeypatch):
+    import threading
     import neurons.miner as m
     from alpharidge_ai import config
     monkeypatch.setattr(config, "MINER_RELEVANCE_CHECK", True, raising=False)
     miner = m.Miner.__new__(m.Miner)
     miner.article_intel_analyzer = SimpleNamespace(client=None, model="m")
+    miner._relevance_check_lock = threading.Lock()   # normally set by __init__
     miner._relevance_check = SimpleNamespace(keep=lambda t, b: True)
     assert miner._relevance_verdict("t", "b") is True
     miner._relevance_check.keep = lambda t, b: False

@@ -201,6 +201,10 @@ class Miner(BaseMinerNeuron):
                 "[Miner] Triage stage failed to initialize (asset gazetteer or "
                 "language detector). The subnet requires triage; fix the named "
                 f"component and restart: {e}") from e
+        # Lock protecting the lazy-initialised _relevance_check instance.
+        # Must be created here (not inside _relevance_verdict) so multiple
+        # worker threads that race during the first batch all see the same lock.
+        self._relevance_check_lock = threading.Lock()
         bt.logging.info("[Miner] Analyzer initialized")
         # NOTE: we intentionally do NOT reuse a single bt.Dendrite across threads/event-loops.
         # Miner responses are sent back to validators from a background thread with its own event loop.
@@ -484,11 +488,8 @@ class Miner(BaseMinerNeuron):
         """The market-relevance check for the triage label, or None when it has no answer."""
         if not self._relevance_check_on():
             return None
-        # Lazy init under a lock — _process_single_article runs on a pool.
-        lock = getattr(self, "_relevance_check_lock", None)
-        if lock is None:
-            self._relevance_check_lock = lock = threading.Lock()
-        with lock:
+        # Lazy init under _relevance_check_lock (created in __init__).
+        with self._relevance_check_lock:
             if getattr(self, "_relevance_check", None) is None:
                 from alpharidge_ai.analyzer.relevance_check import RelevanceCheck
                 from alpharidge_ai.utils import llm_spend
@@ -767,6 +768,17 @@ class Miner(BaseMinerNeuron):
                                     f"verdict ({_judge_ms}ms), emitted unflagged "
                                     f"borderline pass")
                     return
+                # Overflow: all borderline slots taken, check on, no verdict.
+                # The validator's borderline_cap counts all borderlines (flagged +
+                # unflagged) and would reclassify the 4th+ to irrelevant anyway,
+                # generating analysis_on_nonrelevant if a full blob is attached.
+                # Submit irrelevant directly to avoid that soft event.
+                if (triage_rec["label"] == LABEL_BORDERLINE
+                        and self._relevance_check_on()):
+                    triage_rec = build_triage_record(
+                        LABEL_IRRELEVANT, reason_code="non_economic")
+                    bt.logging.info(f"[Miner] Article {article.id}: borderline cap "
+                                    f"exhausted, emitted irrelevant")
                 if triage_rec["label"] == LABEL_IRRELEVANT:
                     article.analysis = NewsArticleAnalysisBase(
                         sentiment="neutral",
