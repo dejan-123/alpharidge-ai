@@ -732,7 +732,9 @@ class Miner(BaseMinerNeuron):
                 # analysis; borderline is then flagged from the analysis result.
                 triage_rec, proof, _ = self.triage_stage.evaluate(
                     _title, article.content or "")
+                _judge_t = time.time()
                 checked = self._relevance_verdict(_title, article.content or "")
+                _judge_ms = int((time.time() - _judge_t) * 1000)
                 if checked is not None:
                     triage_rec = dict(
                         triage_rec,
@@ -761,6 +763,9 @@ class Miner(BaseMinerNeuron):
                             "proof_of_read": proof,
                         },
                     )
+                    bt.logging.info(f"[Miner] Article {article.id}: no relevance "
+                                    f"verdict ({_judge_ms}ms), emitted unflagged "
+                                    f"borderline pass")
                     return
                 if triage_rec["label"] == LABEL_IRRELEVANT:
                     article.analysis = NewsArticleAnalysisBase(
@@ -773,6 +778,9 @@ class Miner(BaseMinerNeuron):
                             "proof_of_read": proof,
                         },
                     )
+                    bt.logging.info(f"[Miner] Article {article.id}: emitted "
+                                    f"irrelevant (reason={triage_rec.get('reason_code')}, "
+                                    f"judge={checked} {_judge_ms}ms)")
                     return
 
                 # V2: Full ArticleIntelligence analysis
@@ -921,6 +929,8 @@ class Miner(BaseMinerNeuron):
                         bt.logging.info(f"[Miner] V2 analysis complete for article {article.id}: "
                                         f"{len(intel.assets)} assets, {len(intel.entities)} entities, "
                                         f"{len(intel.contagion_links)} contagion links | "
+                                        f"label={triage_rec['label']}/{triage_rec.get('flag') or '-'} "
+                                        f"judge={checked} {_judge_ms}ms | "
                                         f"summary={_summary_log}")
                         return
 

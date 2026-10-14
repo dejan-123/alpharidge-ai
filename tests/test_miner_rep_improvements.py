@@ -209,3 +209,136 @@ def test_non_claim_bearing_uses_two_attempts(monkeypatch):
     fallback_model = __import__("os").environ.get("MODEL_FALLBACK", "")
     max_attempts = 3 if fallback_model and miner._claim_bearing(article) else 2
     assert max_attempts == 2
+
+
+# ---- bounded JSON repair (miner path only) -----------------------------------------
+
+def _args_response(arguments):
+    tc = SimpleNamespace(function=SimpleNamespace(arguments=arguments))
+    return SimpleNamespace(
+        choices=[SimpleNamespace(message=SimpleNamespace(tool_calls=[tc]),
+                                 finish_reason="stop")])
+
+
+def test_repair_clean_json_passes_through():
+    a = _analyzer(MagicMock())
+    assert a._repair_tool_args('{"ok": true, "n": 3}') == {"ok": True, "n": 3}
+
+
+def test_repair_salvages_trailing_comma():
+    a = _analyzer(MagicMock())
+    out = a._repair_tool_args('{"ok": true, "x": [1, 2,],}')
+    assert out == {"ok": True, "x": [1, 2]}
+
+
+def test_repair_salvages_truncated_tail():
+    a = _analyzer(MagicMock())
+    out = a._repair_tool_args('{"ok": true, "items": ["a", "b')
+    assert out["ok"] is True
+    # The unterminated '"b' is closed rather than dropped — salvage keeps it.
+    assert out["items"] == ["a", "b"]
+
+
+def test_repair_salvages_control_chars_in_string():
+    a = _analyzer(MagicMock())
+    out = a._repair_tool_args('{"ok": true, "s": "line1\nline2"}')
+    assert out["ok"] is True
+
+
+def test_repair_rejects_garbage_and_non_dicts():
+    a = _analyzer(MagicMock())
+    assert a._repair_tool_args("not json") is None
+    assert a._repair_tool_args("[1, 2]") is None
+    assert a._repair_tool_args("") is None
+
+
+def test_malformed_tool_args_repaired_on_miner_path():
+    client = _client()
+    client.chat.completions.create.return_value = _args_response(
+        '{"ok": true, "x": [1, 2,],}')
+    out = _analyzer(client)._llm_call("p", {}, "extract_and_classify",
+                                      strict=False)
+    assert out["ok"] is True
+
+
+def test_unrepairable_tool_args_miner_returns_empty():
+    client = _client()
+    client.chat.completions.create.return_value = _args_response("garbage{")
+    out = _analyzer(client)._llm_call("p", {}, "extract_and_classify",
+                                      strict=False)
+    assert out == {}
+
+
+def test_malformed_tool_args_strict_still_raises():
+    """Validator/reference calls keep ReferenceUnavailable semantics — a failed
+    reference must skip the audit, not be repaired into grading evidence."""
+    from alpharidge_ai.analyzer.article_intelligence_analyzer import (
+        ReferenceUnavailable)
+    client = _client()
+    client.chat.completions.create.return_value = _args_response('{"ok"')
+    with pytest.raises(ReferenceUnavailable):
+        _analyzer(client)._llm_call("p", {}, "extract_and_classify",
+                                    strict=True)
+
+
+# ---- early deadline gate ------------------------------------------------------------
+
+def test_analyze_deadline_gates_before_ner():
+    """A past-deadline article returns None without touching NER — previously the
+    remote NER/embedding stage ran even when the analysis was already doomed."""
+    import time as _time
+    a = _analyzer(MagicMock())
+    out = a.analyze(article_id=1, url="", title="t", source="s",
+                    content="body", deadline=_time.time() - 1)
+    assert out is None
+
+
+# ---- relevance verdict wiring ---------------------------------------------------------
+
+def test_verdict_none_when_check_disabled(monkeypatch):
+    import neurons.miner as m
+    from alpharidge_ai import config
+    monkeypatch.setattr(config, "MINER_RELEVANCE_CHECK", False, raising=False)
+    miner = m.Miner.__new__(m.Miner)
+    miner.article_intel_analyzer = SimpleNamespace(client=None, model="m")
+    assert miner._relevance_verdict("t", "b") is None
+
+
+def test_verdict_none_without_analyzer(monkeypatch):
+    import neurons.miner as m
+    from alpharidge_ai import config
+    monkeypatch.setattr(config, "MINER_RELEVANCE_CHECK", True, raising=False)
+    miner = m.Miner.__new__(m.Miner)
+    miner.article_intel_analyzer = None
+    assert miner._relevance_verdict("t", "b") is None
+
+
+def test_verdict_delegates_to_judge_keep(monkeypatch):
+    import neurons.miner as m
+    from alpharidge_ai import config
+    monkeypatch.setattr(config, "MINER_RELEVANCE_CHECK", True, raising=False)
+    miner = m.Miner.__new__(m.Miner)
+    miner.article_intel_analyzer = SimpleNamespace(client=None, model="m")
+    miner._relevance_check = SimpleNamespace(keep=lambda t, b: True)
+    assert miner._relevance_verdict("t", "b") is True
+    miner._relevance_check.keep = lambda t, b: False
+    assert miner._relevance_verdict("t", "b") is False
+    miner._relevance_check.keep = lambda t, b: None
+    assert miner._relevance_verdict("t", "b") is None
+
+
+def test_relevance_check_miner_body_prefs(monkeypatch):
+    """Judge calls inherit MINER_PROVIDER_IGNORE via extra_body_fn."""
+    from alpharidge_ai import config
+    from alpharidge_ai.analyzer.relevance_check import RelevanceCheck
+    monkeypatch.setattr(config, "MINER_PROVIDER_IGNORE", "OpenInference",
+                        raising=False)
+    client = _client()
+    client.chat.completions.create.return_value = SimpleNamespace(
+        choices=[SimpleNamespace(
+            message=SimpleNamespace(content='{"relevant": true}'))])
+    rc = RelevanceCheck(client, "m", spend_purpose="miner_relevance",
+                        extra_body_fn=llm_spend.miner_body)
+    assert rc.verdict("t", "b") is True
+    _, kwargs = client.chat.completions.create.call_args
+    assert kwargs["extra_body"] == {"provider": {"ignore": ["OpenInference"]}}

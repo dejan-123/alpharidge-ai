@@ -579,6 +579,11 @@ class ArticleIntelligenceAnalyzer:
         article_text = f"{title}\n\n{summary or ''}\n\n{body_truncated}".strip()
 
         try:
+            # Gate before the NER stage, not just inside _llm_call: the remote
+            # NER/embedding work below is the expensive part and it ran even for
+            # articles that were already past the batch deadline.
+            if deadline is not None and time.time() > deadline:
+                raise ReferenceUnavailable("analyze: deadline exceeded before NER")
             # ── STAGE 1: Deterministic + NER (~1s) ──
             # text_stats/content_hash stay on the plain `content` (Tier-2 gated
             # fields must not move). Only the NER/entity path consumes raw_html,
@@ -839,6 +844,67 @@ class ArticleIntelligenceAnalyzer:
     # LLM
     # ========================================================================
 
+    @staticmethod
+    def _close_json(s: str) -> str:
+        """Close a truncated JSON document: terminate an open string, then close
+        open objects/arrays in stack order."""
+        stack, in_str, esc = [], False, False
+        for ch in s:
+            if in_str:
+                if esc:
+                    esc = False
+                elif ch == "\\":
+                    esc = True
+                elif ch == '"':
+                    in_str = False
+                continue
+            if ch == '"':
+                in_str = True
+            elif ch in "{[":
+                stack.append(ch)
+            elif ch in "}]":
+                if stack:
+                    stack.pop()
+        if in_str:
+            s += '"'
+        closer = {"{": "}", "[": "]"}
+        return s + "".join(closer[b] for b in reversed(stack))
+
+    def _repair_tool_args(self, raw: str) -> Optional[dict]:
+        """Salvage a malformed tool-call argument string (miner path only).
+
+        Providers occasionally emit tool JSON with a stray comma, literal
+        control characters inside strings, or a truncated tail — the payload
+        is still usable when the damage is at the end. Bounded: a fixed small
+        set of candidates, dict results only."""
+        s = (raw or "").strip()
+        if not s:
+            return None
+        decoders = (json.loads,
+                    lambda v: json.JSONDecoder(strict=False).decode(v))
+        candidates = [s]
+        detrailed = re.sub(r",\s*([}\]])", r"\1", s)
+        if detrailed != s:
+            candidates.append(detrailed)
+        # Truncated tail: drop back to each of the last commas, then close.
+        tail = s
+        for _ in range(3):
+            i = tail.rfind(",")
+            if i <= 0:
+                break
+            tail = tail[:i]
+            candidates.append(tail)
+        for cand in candidates:
+            for v in (cand, self._close_json(cand)):
+                for dec in decoders:
+                    try:
+                        out = dec(v)
+                    except Exception:
+                        continue
+                    if isinstance(out, dict):
+                        return out
+        return None
+
     def _llm_call(self, prompt: str, tool: dict, tool_name: str,
                   model: Optional[str] = None, strict: bool = False,
                   purpose: str = "reference:tier3", timeout: float = 45.0,
@@ -892,7 +958,21 @@ class ArticleIntelligenceAnalyzer:
                 elif not tc:
                     problem = "no tool calls returned"
                 else:
-                    parsed = json.loads(tc[0].function.arguments)
+                    try:
+                        parsed = json.loads(tc[0].function.arguments)
+                    except json.JSONDecodeError:
+                        if strict:
+                            raise
+                        # Miner path: a bounded repair is better than burning
+                        # the retry budget — a failed call here becomes an
+                        # 'irrelevant' claim on what may be a claim-bearing
+                        # (gazetteer-hit) article.
+                        parsed = self._repair_tool_args(tc[0].function.arguments)
+                        if parsed is None:
+                            raise
+                        bt.logging.info(
+                            f"[ARTICLE_INTEL] {tool_name}: repaired malformed "
+                            f"tool-call JSON")
                     if auto:
                         llm_spend.note_auto(True)
                     return parsed
