@@ -360,7 +360,33 @@ DISPATCH_QUALITY_GATE_Z = float(os.getenv("DISPATCH_QUALITY_GATE_Z", "3.0"))
 # 0 turns the bound off.
 TRIAGE_RELEVANCE_BOUND = float(os.getenv("TRIAGE_RELEVANCE_BOUND", "2.0"))
 # Relevance claims audited per triage batch, and the rejected share paid in full.
-TRIAGE_RELEVANCE_AUDIT_N = int(os.getenv("TRIAGE_RELEVANCE_AUDIT_N", "1"))
+TRIAGE_RELEVANCE_AUDIT_N = int(os.getenv("TRIAGE_RELEVANCE_AUDIT_N", "2"))
+# Sampled relevance audits (used when TRIAGE_JUDGE_ALL is off).
+TRIAGE_AUDIT_BORDERLINE = _as_bool(os.getenv("TRIAGE_AUDIT_BORDERLINE", "true"))
+TRIAGE_AUDIT_SKIP_GAZETTEER = _as_bool(os.getenv("TRIAGE_AUDIT_SKIP_GAZETTEER", "true"))
+# Every relevance claim is judged against the published definition; a claim judged not
+# relevant earns no premium.
+TRIAGE_JUDGE_ALL = _as_bool(os.getenv("TRIAGE_JUDGE_ALL", "true"))
+# Shadow: compute and log every 3.9.13 rule, but pay and grade exactly as 3.9.12. On until
+# the served value turns it off, so a validator that cannot fetch config never enforces alone.
+TRIAGE_JUDGE_SHADOW = _as_bool(os.getenv("TRIAGE_JUDGE_SHADOW", "true"))
+TRIAGE_JUDGE_MODEL = os.getenv("TRIAGE_JUDGE_MODEL", "deepseek/deepseek-v4-flash")
+TRIAGE_JUDGE_CONFIRM = _as_bool(os.getenv("TRIAGE_JUDGE_CONFIRM", "true"))
+# Repeat offenders: above this decayed share of judged claims found not relevant, a batch
+# with such a claim earns nothing. New hotkeys start at TRIAGE_REPEAT_PRIOR_MULT times the
+# threshold, weighted as TRIAGE_REPEAT_PRIOR_N claims.
+TRIAGE_REPEAT_THRESHOLD = float(os.getenv("TRIAGE_REPEAT_THRESHOLD", "0.05"))
+TRIAGE_REPEAT_PRIOR_N = float(os.getenv("TRIAGE_REPEAT_PRIOR_N", "50"))
+TRIAGE_REPEAT_PRIOR_MULT = float(os.getenv("TRIAGE_REPEAT_PRIOR_MULT", "2.0"))
+TRIAGE_FP_HARD = _as_bool(os.getenv("TRIAGE_FP_HARD", "true"))
+# Premium needs an analysis consistent with a market claim, and a page with an article body.
+PREMIUM_SELF_CONSISTENCY = _as_bool(os.getenv("PREMIUM_SELF_CONSISTENCY", "true"))
+PREMIUM_CONTENT_GATE = _as_bool(os.getenv("PREMIUM_CONTENT_GATE", "true"))
+# A flagged-valuable borderline claim needs value the article itself shows.
+BORDERLINE_VALUE_GROUNDED = _as_bool(os.getenv("BORDERLINE_VALUE_GROUNDED", "true"))
+# Miner: label relevance with the published-definition check.
+MINER_RELEVANCE_CHECK = _as_bool(os.getenv("MINER_RELEVANCE_CHECK", "true"))
+MINER_RELEVANCE_MODEL = os.getenv("MINER_RELEVANCE_MODEL", "")
 TRIAGE_RELEVANCE_AUDIT_TOL = float(os.getenv("TRIAGE_RELEVANCE_AUDIT_TOL", "0.06"))
 # How long a dispatched article may sit in PROCESSING before it is reclaimed. Both readers
 # (article_store.get_timeouts, cooldown._late_threshold_s) used a hardcoded 900 fallback and it
@@ -496,6 +522,19 @@ _REMOTE_CONFIG_KEYS = {
     "DISPATCH_QUALITY_GATE_Z":    (float, "DISPATCH_QUALITY_GATE_Z"),
     "TRIAGE_RELEVANCE_BOUND":     (float, "TRIAGE_RELEVANCE_BOUND"),
     "TRIAGE_RELEVANCE_AUDIT_N":   (int, "TRIAGE_RELEVANCE_AUDIT_N"),
+    "TRIAGE_AUDIT_BORDERLINE":    (_as_bool, "TRIAGE_AUDIT_BORDERLINE"),
+    "TRIAGE_AUDIT_SKIP_GAZETTEER": (_as_bool, "TRIAGE_AUDIT_SKIP_GAZETTEER"),
+    "TRIAGE_FP_HARD":             (_as_bool, "TRIAGE_FP_HARD"),
+    "TRIAGE_JUDGE_ALL":           (_as_bool, "TRIAGE_JUDGE_ALL"),
+    "TRIAGE_JUDGE_SHADOW":        (_as_bool, "TRIAGE_JUDGE_SHADOW"),
+    "TRIAGE_JUDGE_MODEL":         (str,   "TRIAGE_JUDGE_MODEL"),
+    "TRIAGE_JUDGE_CONFIRM":       (_as_bool, "TRIAGE_JUDGE_CONFIRM"),
+    "TRIAGE_REPEAT_THRESHOLD":    (float, "TRIAGE_REPEAT_THRESHOLD"),
+    "TRIAGE_REPEAT_PRIOR_N":      (float, "TRIAGE_REPEAT_PRIOR_N"),
+    "TRIAGE_REPEAT_PRIOR_MULT":   (float, "TRIAGE_REPEAT_PRIOR_MULT"),
+    "PREMIUM_SELF_CONSISTENCY":   (_as_bool, "PREMIUM_SELF_CONSISTENCY"),
+    "PREMIUM_CONTENT_GATE":       (_as_bool, "PREMIUM_CONTENT_GATE"),
+    "BORDERLINE_VALUE_GROUNDED":  (_as_bool, "BORDERLINE_VALUE_GROUNDED"),
     "TRIAGE_RELEVANCE_AUDIT_TOL": (float, "TRIAGE_RELEVANCE_AUDIT_TOL"),
     "SCORING_LEASE_TTL_SECONDS":  (float, "SCORING_LEASE_TTL_SECONDS"),
     "DISPATCH_CHRONIC_TIMEOUT_N": (int,   "DISPATCH_CHRONIC_TIMEOUT_N"),
@@ -572,6 +611,20 @@ _CONSENSUS_KEYS = {
     "EMISSION_BONUS_FULL",
     "EMISSION_N_MIN",
     "SAMPLING_SUBSTANTIVE_WEIGHT",
+    "TRIAGE_RELEVANCE_AUDIT_N",
+    "TRIAGE_AUDIT_BORDERLINE",
+    "TRIAGE_AUDIT_SKIP_GAZETTEER",
+    "TRIAGE_FP_HARD",
+    "TRIAGE_JUDGE_ALL",
+    "TRIAGE_JUDGE_SHADOW",
+    "TRIAGE_JUDGE_MODEL",
+    "TRIAGE_JUDGE_CONFIRM",
+    "TRIAGE_REPEAT_THRESHOLD",
+    "TRIAGE_REPEAT_PRIOR_N",
+    "TRIAGE_REPEAT_PRIOR_MULT",
+    "PREMIUM_SELF_CONSISTENCY",
+    "PREMIUM_CONTENT_GATE",
+    "BORDERLINE_VALUE_GROUNDED",
 }
 
 REMOTE_CONFIG_REFRESH_SECONDS = int(os.getenv("REMOTE_CONFIG_REFRESH_SECONDS", "3600"))
