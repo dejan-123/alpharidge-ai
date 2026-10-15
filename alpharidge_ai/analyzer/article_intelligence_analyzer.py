@@ -346,8 +346,11 @@ EXTRACT_CLASSIFY_TOOL = {
                         "more than a low one."},
                 }, "required": ["metric_name", "value", "unit", "confidence"],
                 }, "description":
-                    "Measured quantities only. NOT dates, times, article timestamps, "
-                    "years, quarters, page or channel numbers."},
+                    "Every measured quantity stated in the article — one claim per "
+                    "number, value copied verbatim, concise metric names (e.g. "
+                    "revenue, eps, gdp_growth). Include prices, percentages, "
+                    "growth rates, revenues, volumes, counts. NOT dates, times, "
+                    "article timestamps, years, quarters, page or channel numbers."},
                 "event_type": {"type": "string", "enum": [e.value for e in EventType]},
                 "event_title": {"type": "string"},
                 "event_date": {"type": "string", "description": "YYYY-MM-DD or null"},

@@ -501,6 +501,28 @@ class Miner(BaseMinerNeuron):
                     extra_body_fn=llm_spend.miner_body)
         return self._relevance_check.keep(title, body)
 
+    def _irrelevant_beyond_doubt(self, title, body):
+        """The validator's own det-audit overrule, run locally: True only when
+        `TriageAuditor.clearly_irrelevant` (no listing named, strict AND lenient
+        verdicts at the audit confidence) agrees the article has no market hook.
+        Used to decide whether a judged veto on a gazetteer hit can safely go
+        out as 'irrelevant' without drawing a false_negative_deterministic."""
+        if not self._relevance_check_on():
+            return False
+        with self._relevance_check_lock:
+            if getattr(self, "_triage_auditor", None) is None:
+                from alpharidge_ai.validator.triage_audit import TriageAuditor
+                from alpharidge_ai.validator.triage_grader import TriageConfig
+                self._triage_auditor = TriageAuditor(
+                    self.article_intel_analyzer.client,
+                    self.article_intel_analyzer.model,
+                    min_confidence=TriageConfig().audit_min_confidence)
+        try:
+            return bool(self._triage_auditor.clearly_irrelevant(title, body))
+        except Exception as e:
+            bt.logging.debug(f"[Miner] clearly_irrelevant unavailable: {e}")
+            return False
+
     async def forward_articles(self, synapse: alpharidge_ai.protocol.ArticleBatch) -> alpharidge_ai.protocol.ArticleBatch:
         validator_hotkey = synapse.dendrite.hotkey if synapse.dendrite else None
         bt.logging.info(f"[Miner] Received ArticleBatch with {len(synapse.article_batch)} article(s) from validator {validator_hotkey}")
@@ -731,21 +753,43 @@ class Miner(BaseMinerNeuron):
 
                 # Label every article. Relevant and borderline get the full
                 # analysis; borderline is then flagged from the analysis result.
-                triage_rec, proof, _ = self.triage_stage.evaluate(
+                triage_rec, proof, matches = self.triage_stage.evaluate(
                     _title, article.content or "")
                 _judge_t = time.time()
                 checked = self._relevance_verdict(_title, article.content or "")
                 _judge_ms = int((time.time() - _judge_t) * 1000)
+                borderline_claim = False
                 if checked is not None:
-                    triage_rec = dict(
-                        triage_rec,
-                        label=LABEL_RELEVANT if checked else LABEL_IRRELEVANT,
-                        confidence=0.9)
-                    if not checked:
-                        # extract_triage rejects an 'irrelevant' record that
-                        # lacks a reason_code — a judged-irrelevant article
-                        # would otherwise draw a triage_malformed soft event.
-                        triage_rec["reason_code"] = "non_economic"
+                    if (not checked) and matches:
+                        # A judge veto on a gazetteer hit is only a safe
+                        # 'irrelevant' claim when the validator's own
+                        # clearly-irrelevant overrule would confirm it —
+                        # anything else is a deterministic false-negative hard
+                        # event. Spend one of the capped borderline slots on the
+                        # marginal cases instead: a flagged-valuable borderline
+                        # is exempt from the gazetteer audit and is paid like a
+                        # relevant claim. No free slot → 'irrelevant' as before.
+                        slot = borderline_slots.acquire(blocking=False)
+                        if slot and self._irrelevant_beyond_doubt(
+                                _title, article.content or ""):
+                            borderline_slots.release()
+                            slot = False
+                        if slot:
+                            borderline_claim = True
+                            triage_rec = dict(
+                                triage_rec, label=LABEL_BORDERLINE,
+                                confidence=0.5)
+                            triage_rec.pop("flag", None)
+                    if not borderline_claim:
+                        triage_rec = dict(
+                            triage_rec,
+                            label=LABEL_RELEVANT if checked else LABEL_IRRELEVANT,
+                            confidence=0.9)
+                        if not checked:
+                            # extract_triage rejects an 'irrelevant' record that
+                            # lacks a reason_code — a judged-irrelevant article
+                            # would otherwise draw a triage_malformed soft event.
+                            triage_rec["reason_code"] = "non_economic"
                 elif (self._relevance_check_on()
                       and triage_rec["label"] != LABEL_IRRELEVANT
                       and borderline_slots.acquire(blocking=False)):
@@ -772,8 +816,11 @@ class Miner(BaseMinerNeuron):
                 # The validator's borderline_cap counts all borderlines (flagged +
                 # unflagged) and would reclassify the 4th+ to irrelevant anyway,
                 # generating analysis_on_nonrelevant if a full blob is attached.
-                # Submit irrelevant directly to avoid that soft event.
+                # Submit irrelevant directly to avoid that soft event. A
+                # borderline_claim above already holds a slot — it is inside the
+                # cap and must reach the flagging step.
                 if (triage_rec["label"] == LABEL_BORDERLINE
+                        and not borderline_claim
                         and self._relevance_check_on()):
                     triage_rec = build_triage_record(
                         LABEL_IRRELEVANT, reason_code="non_economic")

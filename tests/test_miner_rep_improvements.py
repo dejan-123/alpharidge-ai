@@ -344,3 +344,52 @@ def test_relevance_check_miner_body_prefs(monkeypatch):
     assert rc.verdict("t", "b") is True
     _, kwargs = client.chat.completions.create.call_args
     assert kwargs["extra_body"] == {"provider": {"ignore": ["OpenInference"]}}
+
+
+# ---- clearly-irrelevant confirmation (det-audit mirror) -----------------------------
+
+def test_beyond_doubt_delegates_to_auditor(monkeypatch):
+    import threading
+    import neurons.miner as m
+    from alpharidge_ai import config
+    monkeypatch.setattr(config, "MINER_RELEVANCE_CHECK", True, raising=False)
+    miner = m.Miner.__new__(m.Miner)
+    miner.article_intel_analyzer = SimpleNamespace(client=None, model="m")
+    miner._relevance_check_lock = threading.Lock()   # normally set by __init__
+    miner._triage_auditor = SimpleNamespace(
+        clearly_irrelevant=lambda t, b: True)
+    assert miner._irrelevant_beyond_doubt("t", "b") is True
+    miner._triage_auditor.clearly_irrelevant = lambda t, b: False
+    assert miner._irrelevant_beyond_doubt("t", "b") is False
+
+
+def test_beyond_doubt_false_when_check_disabled(monkeypatch):
+    import neurons.miner as m
+    from alpharidge_ai import config
+    monkeypatch.setattr(config, "MINER_RELEVANCE_CHECK", False, raising=False)
+    miner = m.Miner.__new__(m.Miner)
+    miner.article_intel_analyzer = SimpleNamespace(client=None, model="m")
+    assert miner._irrelevant_beyond_doubt("t", "b") is False
+
+
+def test_beyond_doubt_false_without_analyzer(monkeypatch):
+    import neurons.miner as m
+    from alpharidge_ai import config
+    monkeypatch.setattr(config, "MINER_RELEVANCE_CHECK", True, raising=False)
+    miner = m.Miner.__new__(m.Miner)
+    miner.article_intel_analyzer = None
+    assert miner._irrelevant_beyond_doubt("t", "b") is False
+
+
+def test_beyond_doubt_false_on_auditor_error(monkeypatch):
+    import threading
+    import neurons.miner as m
+    from alpharidge_ai import config
+    monkeypatch.setattr(config, "MINER_RELEVANCE_CHECK", True, raising=False)
+    miner = m.Miner.__new__(m.Miner)
+    miner.article_intel_analyzer = SimpleNamespace(client=None, model="m")
+    miner._relevance_check_lock = threading.Lock()
+    def _boom(t, b):
+        raise RuntimeError("auditor exploded")
+    miner._triage_auditor = SimpleNamespace(clearly_irrelevant=_boom)
+    assert miner._irrelevant_beyond_doubt("t", "b") is False
